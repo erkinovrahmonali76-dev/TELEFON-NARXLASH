@@ -420,232 +420,142 @@ async def buy_plan(call: CallbackQuery):
     await call.message.answer(tr(lang,"pay", holder=PAYMENT_HOLDER, card=PAYMENT_CARD))
     await call.message.answer(tr(lang,"wait"))
     await call.answer()
+# =========================
+# RECEIPT AND VIDEO HANDLER
+# =========================
 
 @router.message(F.photo | F.document)
 async def receipt_or_video(message: Message):
     uid = message.from_user.id
     mode = user_modes.get(uid)
+
     row = user_row(uid)
     lang = row["lang"] if row and row["lang"] else "uz"
-    if isinstance(mode, str) and mode.startswith("receipt:"):
-        _, days, amount = mode.split(":")
-        file_id = message.photo[-1].file_id if message.photo else message.document.file_id
-        pid = add_payment(uid, int(days), int(amount), file_id)
+
+    # VIDEO REJIMI
+    if mode in ("round", "916"):
+        await process_uploaded(message, mode, lang)
         user_modes.pop(uid, None)
-        await message.answer(tr(lang,"receipt"), reply_markup=main_keyboard(lang, is_pro(uid)))
-        plan = f"{days} kun / {amount:,} so‘m".replace(",", " ")
-        admin_text = tr("uz","pending", uid=uid, plan=plan)
-        await bot.send_message(ADMIN_ID, admin_text,
-          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"payok:{pid}"),
-             InlineKeyboardButton(text="❌ Rad etish", callback_data=f"payno:{pid}")]
-          ]))
-        try:
-            await bot.copy_message(ADMIN_ID, message.chat.id, message.message_id)
-        except Exception:
-            log.exception("Receipt forwarding failed")
         return
-    if mode in ("round","916"):
-        await process_uploaded(message, mode, lang)
-        return
-    await message.answer(tr(lang,"unknown"), reply_markup=main_keyboard(lang, is_pro(uid)))
 
-@router.callback_query(F.data.startswith("payok:"))
-async def admin_approve(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("Admin emas", show_alert=True)
-        return
-    pid = int(call.data.split(":")[1])
-    result = approve_payment(pid)
-    if not result:
-        await call.answer("To‘lov allaqachon ko‘rib chiqilgan.", show_alert=True)
-        return
-    payment, expiry = result
-    u = user_row(payment["user_id"])
-    lang = u["lang"] if u and u["lang"] else "uz"
-    await bot.send_message(payment["user_id"], tr(lang,"approved", days=payment["days"]),
-                           reply_markup=main_keyboard(lang, True))
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer(tr("uz","approved_admin"))
-    await call.answer("PRO yoqildi")
-
-@router.callback_query(F.data.startswith("payno:"))
-async def admin_reject(call: CallbackQuery):
-    if call.from_user.id != ADMIN_ID:
-        await call.answer("Admin emas", show_alert=True)
-        return
-    pid = int(call.data.split(":")[1])
-    payment = reject_payment(pid)
-    if not payment:
-        await call.answer("To‘lov allaqachon ko‘rib chiqilgan.", show_alert=True)
-        return
-    u = user_row(payment["user_id"])
-    lang = u["lang"] if u and u["lang"] else "uz"
-    await bot.send_message(payment["user_id"], tr(lang,"rejected"))
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer(tr("uz","rejected_admin"))
-    await call.answer("Rad etildi")
-
-def video_info(message):
-    if message.video:
-        return message.video.file_id, message.video.file_size, message.video.duration
-    if message.document and (message.document.mime_type or "").startswith("video/"):
-        return message.document.file_id, message.document.file_size, None
-    return None
-
-async def get_telegram_video(message, dst):
-    info = video_info(message)
-    if not info:
-        raise ValueError("Video fayl yuboring.")
-    fid, size, duration = info
-    if size and size > MAX_INPUT:
-        raise ValueError("Telegram orqali yuklanadigan video 20 MB dan oshmasin.")
-    if duration and duration > MAX_VIDEO_SECONDS:
-        raise ValueError("Video 10 daqiqadan uzun.")
-    f = await bot.get_file(fid)
-    await bot.download_file(f.file_path, destination=dst)
-
-async def ffmpeg(args):
-    async with MEDIA_SEMAPHORE:
-        p = await asyncio.create_subprocess_exec(
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-            "-threads", "2", *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+    # CHEK REJIMI
+    if not isinstance(mode, str) or not mode.startswith("receipt:"):
+        await message.answer(
+            tr(lang, "unknown"),
+            reply_markup=main_keyboard(lang, is_pro(uid))
         )
-        _, err = await p.communicate()
-        if p.returncode:
-            raise RuntimeError(err.decode("utf-8", "ignore")[-700:] or "FFmpeg xatosi")
-
-async def process_uploaded(message, mode, lang):
-    status = await message.answer("⏳ Video tayyorlanmoqda...")
-    try:
-        with tempfile.TemporaryDirectory(prefix="asaved_") as td:
-            src, out = Path(td)/"input.mp4", Path(td)/"output.mp4"
-            await get_telegram_video(message, src)
-            if mode == "round":
-                await ffmpeg(["-i",str(src),"-t","60","-vf",
-                    "scale=480:480:force_original_aspect_ratio=increase,crop=480:480,setsar=1",
-                    "-c:v","libx264","-preset","ultrafast","-crf","28","-threads","2","-c:a","aac","-b:a","80k",
-                    "-movflags","+faststart",str(out)])
-                if out.stat().st_size > MAX_OUTPUT:
-                    raise ValueError(tr(lang,"too_big"))
-                await message.answer_video_note(FSInputFile(out))
-            else:
-                await ffmpeg(["-i",str(src),"-vf",
-                    "scale=540:960:force_original_aspect_ratio=increase,crop=540:960,setsar=1",
-                    "-c:v","libx264","-preset","ultrafast","-crf","27","-threads","2","-c:a","aac","-b:a","96k",
-                    "-movflags","+faststart",str(out)])
-                if out.stat().st_size > MAX_OUTPUT:
-                    raise ValueError(tr(lang,"too_big"))
-                await message.answer_video(FSInputFile(out),caption=tr(lang,"916_done"))
-        await status.delete()
-    except Exception as e:
-        log.exception("Upload video processing failed")
-        await status.edit_text("❌ " + str(e)[:500])
-    finally:
-        user_modes.pop(message.from_user.id, None)
-
-ALLOWED_HOSTS = {
- "youtube.com","www.youtube.com","m.youtube.com","youtu.be",
- "instagram.com","www.instagram.com",
- "tiktok.com","www.tiktok.com","vm.tiktok.com","vt.tiktok.com"
-}
-def valid_url(url):
-    try:
-        p=urlparse(url.strip())
-        host=(p.hostname or "").lower()
-        return p.scheme=="https" and (host in ALLOWED_HOSTS or any(host.endswith("."+h) for h in ALLOWED_HOSTS))
-    except Exception:
-        return False
-
-async def ytdlp_download(url, folder):
-    import yt_dlp
-    opts={"format":"best[height<=720]/best","outtmpl":str(folder/"source.%(ext)s"),
-          "noplaylist":True,"max_filesize":MAX_OUTPUT,"socket_timeout":15,
-          "retries":1,"fragment_retries":1,"concurrent_fragment_downloads":4,
-          "quiet":True,"no_warnings":True,"merge_output_format":"mp4"}
-    def work():
-        with yt_dlp.YoutubeDL(opts) as y:
-            y.download([url])
-    await asyncio.to_thread(work)
-    fs=[p for p in folder.iterdir() if p.is_file() and p.name.startswith("source.")]
-    if not fs:
-        raise RuntimeError("Video topilmadi yoki platforma yuklashga ruxsat bermadi.")
-    f=max(fs,key=lambda p:p.stat().st_size)
-    if f.stat().st_size>MAX_OUTPUT:
-        raise RuntimeError("Video 49 MB dan katta.")
-    return f
-
-@router.message(F.video | F.video_note)
-async def video_without_mode(message: Message):
-    row = user_row(message.from_user.id)
-    lang = row["lang"] if row and row["lang"] else "uz"
-    mode = user_modes.get(message.from_user.id)
-    if mode in ("round", "916") and message.video:
-        if not await require_access(message, lang):
-            return
-        await process_uploaded(message, mode, lang)
         return
-    await message.answer(tr(lang,"unknown"), reply_markup=main_keyboard(lang,is_pro(message.from_user.id)))
 
-# Link mode text dispatch is implemented as a high-priority middleware-like handler
-# by checking link mode at the beginning of the text router via this wrapper.
-# (The function below is registered with a filter and runs only for link mode.)
-@router.callback_query(F.data.in_({"linkvideo","linkaudio","linkcancel"}))
-async def link_choice(call: CallbackQuery):
-    uid=call.from_user.id
-    mode=user_modes.get(uid,"")
-    if not mode.startswith("link_choice:"):
-        await call.answer("Havola eskirgan. Qayta yuboring.",show_alert=True); return
-    url=mode.split(":",1)[1]
-    row=user_row(uid); lang=row["lang"] if row and row["lang"] else "uz"
-    if call.data=="linkcancel":
-        user_modes.pop(uid,None); await call.message.edit_text("Bekor qilindi."); await call.answer(); return
-    audio=call.data=="linkaudio"
-    if audio and (not is_pro(uid) or "instagram.com" not in (urlparse(url).hostname or "")):
-        await call.answer(tr(lang,"notpro"),show_alert=True); return
-    user_modes.pop(uid,None)
-    await call.answer()
-    status=await call.message.answer("⏳ Video olinmoqda..." if not audio else "⏳ Audio tayyorlanmoqda...")
     try:
-        with tempfile.TemporaryDirectory(prefix="asaved_link_") as td:
-            folder=Path(td)
-            src=await ytdlp_download(url,folder)
-            if audio:
-                out=folder/"audio.mp3"
-                await ffmpeg(["-i",str(src),"-vn","-codec:a","libmp3lame","-b:a","192k",str(out)])
-                if out.stat().st_size>MAX_OUTPUT: raise RuntimeError(tr(lang,"too_big"))
-                await call.message.answer_audio(FSInputFile(out),caption="🎵 Audio tayyor!")
-            else:
-                await call.message.answer_video(FSInputFile(src),caption="🎬 Video tayyor!")
-        await status.delete()
+        _, days, amount = mode.split(":")
+        days = int(days)
+        amount = int(amount)
+    except (ValueError, TypeError):
+        await message.answer("❌ To‘lov ma’lumotlarida xatolik.")
+        return
+
+    # Rasm yoki PDF tekshirish
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        is_photo = True
+
+    elif message.document:
+        document = message.document
+        mime = document.mime_type or ""
+
+        if mime != "application/pdf":
+            await message.answer(
+                "❌ Iltimos, chek rasmini yoki PDF faylini yuboring."
+            )
+            return
+
+        file_id = document.file_id
+        is_photo = False
+
+    else:
+        return
+
+    # TO‘LOVNI BAZAGA YOZISH
+    try:
+        pid = add_payment(
+            uid,
+            days,
+            amount,
+            file_id
+        )
     except Exception:
-        log.exception("Link processing failed")
-        await status.edit_text(tr(lang,"fail"))
+        log.exception("Payment database error")
+        await message.answer(
+            "❌ Chekni saqlashda xatolik yuz berdi."
+        )
+        return
 
-async def on_startup(app):
-    init_db()
-    await bot.set_webhook(f"{BASE_URL}/{WEBHOOK_PATH}",secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,allowed_updates=dp.resolve_used_update_types())
-    log.info("Webhook set: %s/%s",BASE_URL,WEBHOOK_PATH)
+    plan = (
+        f"{days} kun / {amount:,} so‘m"
+        .replace(",", " ")
+    )
 
-async def on_cleanup(app):
-    await bot.delete_webhook(drop_pending_updates=False)
-    await bot.session.close()
+    admin_text = (
+        "💳 <b>YANGI PRO TO‘LOV</b>\n\n"
+        f"👤 Foydalanuvchi ID: <code>{uid}</code>\n"
+        f"📦 Tarif: <b>{plan}</b>\n"
+        f"💰 Summa: <b>{amount:,} so‘m</b>\n"
+        f"🧾 To‘lov ID: <code>{pid}</code>\n\n"
+        "Chekni tekshiring:"
+    )
 
-async def main():
-    app=web.Application(client_max_size=2*1024*1024)
-    app.router.add_get("/",lambda r:web.Response(text="ASAVED PRO bot is running"))
-    app.router.add_get("/health",lambda r:web.Response(text="ok"))
-    SimpleRequestHandler(dispatcher=dp,bot=bot,secret_token=WEBHOOK_SECRET).register(app,path=f"/{WEBHOOK_PATH}")
-    setup_application(app,dp,bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
-    runner=web.AppRunner(app); await runner.setup()
-    site=web.TCPSite(runner,"0.0.0.0",PORT); await site.start()
-    log.info("ASAVED started on port %s",PORT)
-    await asyncio.Event().wait()
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Tasdiqlash",
+                    callback_data=f"payok:{pid}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Rad etish",
+                    callback_data=f"payno:{pid}"
+                )
+            ]
+        ]
+    )
 
-if __name__=="__main__":
-    asyncio.run(main())
+    # CHEKNI ADMIN GA YUBORISH
+    try:
+        if is_photo:
+            await bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=file_id,
+                caption=admin_text,
+                reply_markup=keyboard
+            )
+        else:
+            await bot.send_document(
+                chat_id=ADMIN_ID,
+                document=file_id,
+                caption=admin_text,
+                reply_markup=keyboard
+            )
+
+    except Exception:
+        log.exception("ADMIN CHEK YUBORISH XATOSI")
+
+        try:
+            reject_payment(pid)
+        except Exception:
+            log.exception("Payment rejection database error")
+
+        await message.answer(
+            "❌ Chek adminga yetkazilmadi.\n"
+            "Admin botga /start bosganini va ADMIN_ID "
+            "to‘g‘riligini tekshiring."
+        )
+        return
+
+    # FAQAT ADMIN GA YETKAZILGANDAN KEYIN
+    user_modes.pop(uid, None)
+
+    await message.answer(
+        "✅ Chekingiz adminga yuborildi!\n\n"
+        "⏳ Admin to‘lovni tekshiradi. "
+        "Tasdiqlangandan keyin PRO faollashadi."
+    )
