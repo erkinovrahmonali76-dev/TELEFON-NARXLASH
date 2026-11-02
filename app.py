@@ -39,6 +39,9 @@ MAX_INPUT = 20 * 1024 * 1024
 MAX_OUTPUT = 49 * 1024 * 1024
 MAX_VIDEO_SECONDS = 600
 
+# Cheklangan parallel video ishlovlari kichik serverni band qilib qo‘ymasligi uchun.
+MEDIA_SEMAPHORE = asyncio.Semaphore(2)
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN kiritilmagan")
 if not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
@@ -503,11 +506,16 @@ async def get_telegram_video(message, dst):
     await bot.download_file(f.file_path, destination=dst)
 
 async def ffmpeg(args):
-    p = await asyncio.create_subprocess_exec("ffmpeg","-y","-hide_banner","-loglevel","error",*args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    _, err = await p.communicate()
-    if p.returncode:
-        raise RuntimeError(err.decode("utf-8","ignore")[-700:] or "FFmpeg xatosi")
+    async with MEDIA_SEMAPHORE:
+        p = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-threads", "2", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        _, err = await p.communicate()
+        if p.returncode:
+            raise RuntimeError(err.decode("utf-8", "ignore")[-700:] or "FFmpeg xatosi")
 
 async def process_uploaded(message, mode, lang):
     status = await message.answer("⏳ Video tayyorlanmoqda...")
@@ -517,16 +525,16 @@ async def process_uploaded(message, mode, lang):
             await get_telegram_video(message, src)
             if mode == "round":
                 await ffmpeg(["-i",str(src),"-t","60","-vf",
-                    "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,setsar=1",
-                    "-c:v","libx264","-preset","veryfast","-crf","27","-c:a","aac","-b:a","96k",
+                    "scale=480:480:force_original_aspect_ratio=increase,crop=480:480,setsar=1",
+                    "-c:v","libx264","-preset","ultrafast","-crf","28","-threads","2","-c:a","aac","-b:a","80k",
                     "-movflags","+faststart",str(out)])
                 if out.stat().st_size > MAX_OUTPUT:
                     raise ValueError(tr(lang,"too_big"))
                 await message.answer_video_note(FSInputFile(out))
             else:
                 await ffmpeg(["-i",str(src),"-vf",
-                    "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
-                    "-c:v","libx264","-preset","veryfast","-crf","26","-c:a","aac","-b:a","128k",
+                    "scale=540:960:force_original_aspect_ratio=increase,crop=540:960,setsar=1",
+                    "-c:v","libx264","-preset","ultrafast","-crf","27","-threads","2","-c:a","aac","-b:a","96k",
                     "-movflags","+faststart",str(out)])
                 if out.stat().st_size > MAX_OUTPUT:
                     raise ValueError(tr(lang,"too_big"))
@@ -553,9 +561,10 @@ def valid_url(url):
 
 async def ytdlp_download(url, folder):
     import yt_dlp
-    opts={"format":"best[height<=1080]/best","outtmpl":str(folder/"source.%(ext)s"),
-          "noplaylist":True,"max_filesize":MAX_OUTPUT,"socket_timeout":25,
-          "retries":2,"quiet":True,"no_warnings":True,"merge_output_format":"mp4"}
+    opts={"format":"best[height<=720]/best","outtmpl":str(folder/"source.%(ext)s"),
+          "noplaylist":True,"max_filesize":MAX_OUTPUT,"socket_timeout":15,
+          "retries":1,"fragment_retries":1,"concurrent_fragment_downloads":4,
+          "quiet":True,"no_warnings":True,"merge_output_format":"mp4"}
     def work():
         with yt_dlp.YoutubeDL(opts) as y:
             y.download([url])
