@@ -15,7 +15,13 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")
 
+if RENDER_URL:
+    bot.set_webhook(url=f"{RENDER_URL}/webhook")
+    print("TELEGRAM WEBHOOK CONNECTED")
+else:
+    print("RENDER URL NOT FOUND")
 # DATABASE
 def db():
     conn = sqlite3.connect("database.db")
