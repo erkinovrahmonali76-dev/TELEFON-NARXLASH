@@ -3,6 +3,7 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -18,7 +19,10 @@ from aiogram.types import (
     Update,
 )
 
-# SOZLAMALAR
+# ==============================
+# ASAVED SOZLAMALARI
+# ==============================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "asaved_secret_2026")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook")
@@ -26,12 +30,17 @@ PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 MAX_SIZE = 45 * 1024 * 1024
+DOWNLOAD_LIMIT = asyncio.Semaphore(2)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
+
 log = logging.getLogger("ASAVED")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment Variables ichida yo'q")
+    raise RuntimeError("BOT_TOKEN kiritilmagan!")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -52,15 +61,25 @@ keyboard = ReplyKeyboardMarkup(
 )
 
 
+# ==============================
+# HAVOLANI TEKSHIRISH
+# ==============================
+
 def valid_video_url(url):
     pattern = (
         r"https?://"
-        r"(?:www\.)?"
-        r"(?:youtube\.com|youtu\.be|instagram\.com|tiktok\.com)"
+        r"(?:www\.|m\.)?"
+        r"(?:youtube\.com|youtu\.be|instagram\.com|"
+        r"tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com)"
         r"(?:/[^\s]*)?"
     )
+
     return re.fullmatch(pattern, url.strip(), re.I) is not None
 
+
+# ==============================
+# VIDEO YUKLASH
+# ==============================
 
 def download_media_sync(url, folder):
     folder = Path(folder)
@@ -71,13 +90,23 @@ def download_media_sync(url, folder):
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "retries": 2,
-        "fragment_retries": 2,
-        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "file_access_retries": 2,
+        "socket_timeout": 25,
         "concurrent_fragment_downloads": 4,
         "merge_output_format": "mp4",
         "max_filesize": MAX_SIZE,
+        "overwrites": True,
+        "cachedir": False,
     }
+
+    # Deno mavjud bo'lsa, YouTube JS ishlashiga yordam beradi
+    if shutil.which("deno"):
+        options["js_runtimes"] = {
+            "deno": {}
+        }
 
     with yt_dlp.YoutubeDL(options) as ydl:
         ydl.download([url])
@@ -85,19 +114,27 @@ def download_media_sync(url, folder):
     files = [
         p for p in folder.iterdir()
         if p.is_file()
-        and p.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov")
+        and p.suffix.lower() in (
+            ".mp4", ".mkv", ".webm", ".mov", ".m4v"
+        )
     ]
 
     if not files:
-        raise RuntimeError("Video topilmadi")
+        raise RuntimeError(
+            "Video fayli topilmadi. Havola yoki platforma cheklovini tekshiring."
+        )
 
     result = max(files, key=lambda p: p.stat().st_size)
 
     if result.stat().st_size > MAX_SIZE:
-        raise RuntimeError("Video hajmi juda katta")
+        raise RuntimeError("Video hajmi 45 MB dan katta.")
 
     return result
 
+
+# ==============================
+# VIDEO FORMATINI O'ZGARTIRISH
+# ==============================
 
 async def ffmpeg_convert(source, output, mode):
     if mode == "round":
@@ -112,7 +149,8 @@ async def ffmpeg_convert(source, output, mode):
         )
 
     cmd = [
-        "ffmpeg", "-y",
+        "ffmpeg",
+        "-y",
         "-i", str(source),
         "-vf", video_filter,
         "-c:v", "libx264",
@@ -121,7 +159,9 @@ async def ffmpeg_convert(source, output, mode):
         "-c:a", "aac",
         "-b:a", "96k",
         "-threads", "2",
+        "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
+        "-max_muxing_queue_size", "1024",
         str(output),
     ]
 
@@ -135,17 +175,21 @@ async def ffmpeg_convert(source, output, mode):
 
     if process.returncode != 0:
         raise RuntimeError(
-            error.decode(errors="ignore")[-700:]
+            error.decode(errors="ignore")[-1000:]
         )
 
     if not output.exists():
-        raise RuntimeError("Tayyor video yaratilmagan")
+        raise RuntimeError("Tayyor video yaratilmadi.")
 
     if output.stat().st_size > MAX_SIZE:
-        raise RuntimeError("Tayyor video hajmi juda katta")
+        raise RuntimeError("Tayyor video hajmi 45 MB dan katta.")
 
     return output
 
+
+# ==============================
+# TAYYOR VIDEONI YUBORISH
+# ==============================
 
 async def send_converted(message, source, mode):
     status = await message.answer("⏳ Video tayyorlanmoqda...")
@@ -168,43 +212,65 @@ async def send_converted(message, source, mode):
 
         await status.delete()
 
-    except Exception:
-        log.exception("VIDEO CONVERSION ERROR")
+    except Exception as e:
+        log.exception("CONVERSION ERROR")
+
         await status.edit_text(
-            "❌ Videoni tayyorlab bo'lmadi. Boshqa video yuborib ko'ring."
+            "❌ Video tayyorlashda xatolik:\n"
+            + str(e)[:700]
         )
 
+
+# ==============================
+# START
+# ==============================
 
 @dp.message(CommandStart())
 async def start(message: Message):
     await message.answer(
         "👋 ASAVED botiga xush kelibsiz!\n\n"
-        "📱 9:16 video — vertikal video tayyorlaydi.\n"
+        "📱 9:16 video — videoni vertikal formatga o'tkazadi.\n"
         "⭕ Dumaloq video — Telegram dumaloq video qiladi.\n"
-        "🔗 Video havolasi — YouTube, Instagram va TikTok videosini yuklaydi.",
+        "🔗 Video havolasi — YouTube, Instagram va TikTok videosini yuklaydi.\n\n"
+        "Kerakli bo'limni tanlang:",
         reply_markup=keyboard
     )
 
 
+# ==============================
+# MENYU
+# ==============================
+
 @dp.message(F.text == "📱 9:16 video")
 async def choose_vertical(message: Message):
     user_modes[message.from_user.id] = "916"
-    await message.answer("📹 9:16 qilmoqchi bo'lgan videongizni yuboring.")
+
+    await message.answer(
+        "📹 9:16 qilmoqchi bo'lgan videongizni yuboring."
+    )
 
 
 @dp.message(F.text == "⭕ Dumaloq video")
 async def choose_round(message: Message):
     user_modes[message.from_user.id] = "round"
-    await message.answer("⭕ Dumaloq qilmoqchi bo'lgan videongizni yuboring.")
+
+    await message.answer(
+        "⭕ Dumaloq qilmoqchi bo'lgan videongizni yuboring."
+    )
 
 
 @dp.message(F.text == "🔗 Video havolasi")
 async def choose_link(message: Message):
     user_modes[message.from_user.id] = "link"
+
     await message.answer(
-        "🔗 YouTube, Instagram yoki TikTok video havolasini yuboring."
+        "🔗 YouTube, Instagram yoki TikTok havolasini yuboring."
     )
 
+
+# ==============================
+# TELEFONDAN VIDEO
+# ==============================
 
 @dp.message(F.video)
 async def uploaded_video(message: Message):
@@ -213,7 +279,7 @@ async def uploaded_video(message: Message):
 
     if mode not in ("916", "round"):
         await message.answer(
-            "Avval 📱 9:16 video yoki ⭕ Dumaloq video tugmasini bosing.",
+            "Avval video formatini tanlang.",
             reply_markup=keyboard
         )
         return
@@ -229,21 +295,37 @@ async def uploaded_video(message: Message):
             source = Path(tmp) / "source.mp4"
 
             file = await bot.get_file(message.video.file_id)
-            await bot.download_file(file.file_path, destination=source)
+
+            await bot.download_file(
+                file.file_path,
+                destination=source
+            )
 
             if source.stat().st_size > MAX_SIZE:
-                raise RuntimeError("Video hajmi juda katta")
+                raise RuntimeError("Video hajmi juda katta.")
 
             await status.delete()
+
             await send_converted(message, source, mode)
 
-    except Exception:
+    except Exception as e:
         log.exception("UPLOAD ERROR")
-        await status.edit_text("❌ Videoni olishda xatolik yuz berdi.")
+
+        try:
+            await status.edit_text(
+                "❌ Videoni olishda xatolik:\n"
+                + str(e)[:500]
+            )
+        except Exception:
+            pass
 
     finally:
         user_modes.pop(uid, None)
 
+
+# ==============================
+# VIDEO FAYL
+# ==============================
 
 @dp.message(F.document)
 async def uploaded_document(message: Message):
@@ -252,7 +334,8 @@ async def uploaded_document(message: Message):
     if not doc.mime_type or not doc.mime_type.startswith("video/"):
         return
 
-    mode = user_modes.get(message.from_user.id)
+    uid = message.from_user.id
+    mode = user_modes.get(uid)
 
     if mode not in ("916", "round"):
         await message.answer("Avval video formatini tanlang.")
@@ -269,18 +352,33 @@ async def uploaded_document(message: Message):
             source = Path(tmp) / "source.mp4"
 
             file = await bot.get_file(doc.file_id)
-            await bot.download_file(file.file_path, destination=source)
+
+            await bot.download_file(
+                file.file_path,
+                destination=source
+            )
 
             await status.delete()
+
             await send_converted(message, source, mode)
 
-    except Exception:
+    except Exception as e:
         log.exception("DOCUMENT ERROR")
-        await status.edit_text("❌ Videoni olishda xatolik yuz berdi.")
+
+        try:
+            await status.edit_text(
+                "❌ Xatolik:\n" + str(e)[:500]
+            )
+        except Exception:
+            pass
 
     finally:
-        user_modes.pop(message.from_user.id, None)
+        user_modes.pop(uid, None)
 
+
+# ==============================
+# YOUTUBE / INSTAGRAM / TIKTOK
+# ==============================
 
 @dp.message(F.text)
 async def link_handler(message: Message):
@@ -289,48 +387,75 @@ async def link_handler(message: Message):
     if not valid_video_url(url):
         return
 
-    status = await message.answer("⏳ Video yuklanmoqda...")
+    status = await message.answer(
+        "⏳ Video yuklanmoqda..."
+    )
 
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            source = await asyncio.to_thread(
-                download_media_sync, url, tmp
-            )
+        async with DOWNLOAD_LIMIT:
+            with tempfile.TemporaryDirectory() as tmp:
+                source = await asyncio.to_thread(
+                    download_media_sync,
+                    url,
+                    tmp
+                )
 
-            output = Path(tmp) / "vertical.mp4"
+                output = Path(tmp) / "vertical.mp4"
 
-            await ffmpeg_convert(source, output, "916")
+                await ffmpeg_convert(
+                    source,
+                    output,
+                    "916"
+                )
 
-            await message.answer_video(
-                video=FSInputFile(output),
-                caption="✅ 9:16 video tayyor!"
-            )
+                await message.answer_video(
+                    video=FSInputFile(output),
+                    caption="✅ 9:16 video tayyor!"
+                )
 
         await status.delete()
 
-    except Exception:
+    except Exception as e:
         log.exception("LINK DOWNLOAD ERROR")
-        await status.edit_text(
-            "❌ Video yuklanmadi.\n"
-            "Havola ochiq ekanini tekshiring yoki boshqa havola yuboring."
-        )
 
+        try:
+            await status.edit_text(
+                "❌ Video yuklanmadi.\n\n"
+                "Xatolik sababi:\n"
+                + str(e)[:800]
+            )
+        except Exception:
+            pass
+
+
+# ==============================
+# WEBHOOK
+# ==============================
 
 async def health(request):
     return web.Response(text="ASAVED OK")
 
 
 async def webhook(request):
-    if WEBHOOK_SECRET:
-        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if secret != WEBHOOK_SECRET:
-            return web.Response(status=403)
+    secret = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token"
+    )
+
+    if secret != WEBHOOK_SECRET:
+        return web.Response(status=403)
 
     try:
         data = await request.json()
-        update = Update.model_validate(data, context={"bot": bot})
+
+        update = Update.model_validate(
+            data,
+            context={"bot": bot}
+        )
+
         await dp.feed_update(bot, update)
+
         return web.Response(text="OK")
+
     except Exception:
         log.exception("WEBHOOK ERROR")
         return web.Response(status=500)
@@ -338,13 +463,16 @@ async def webhook(request):
 
 async def on_startup(app):
     if not BASE_URL:
-        raise RuntimeError("RENDER_EXTERNAL_URL topilmadi")
+        raise RuntimeError(
+            "RENDER_EXTERNAL_URL topilmadi!"
+        )
 
     await bot.set_webhook(
         url=f"{BASE_URL}/{WEBHOOK_PATH}",
         secret_token=WEBHOOK_SECRET
     )
-    log.info("ASAVED webhook ishga tushdi")
+
+    log.info("ASAVED BOT ISHGA TUSHDI")
 
 
 async def on_shutdown(app):
@@ -352,11 +480,20 @@ async def on_shutdown(app):
 
 
 app = web.Application()
+
 app.router.add_get("/", health)
-app.router.add_post(f"/{WEBHOOK_PATH}", webhook)
+app.router.add_post(
+    f"/{WEBHOOK_PATH}",
+    webhook
+)
+
 app.on_startup.append(on_startup)
 app.on_shutdown.append(on_shutdown)
 
 
 if __name__ == "__main__":
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    web.run_app(
+        app,
+        host="0.0.0.0",
+        port=PORT
+    )
