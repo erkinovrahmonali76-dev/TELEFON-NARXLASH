@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: telegram-music-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+    envVars:
+      - key: 9110344656:AAF1_ccbBplKbCcpEOuq1y3Evg8XhTveGp8
+        sync: false
+      - key: AkoshSaved
+        value: "@akoshsaved"
+      - key: https://t.me/akoshsaved
+        value: "https://t.me/akoshsaved"
+      - key: 8461889678
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: WEBHOOK_PATH
+        generateValue: true
