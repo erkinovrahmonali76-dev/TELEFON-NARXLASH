@@ -325,12 +325,14 @@ async def select_track(call):
                 ]
             ]
         )
-        caption = (
-            f"🎵 <b>{title}</b>\n\n"
-            f"👤 {artist}\n"
-            f"⏱ {item.get('duration', 'Noma\\'lum')}\n\n"
-            "🎧 <b>ASAVED MUSIC</b>"
-        )
+        duration = item.get("duration", "Noma'lum")
+
+caption = (
+    f"🎵 <b>{title}</b>\n\n"
+    f"👤 {artist}\n"
+    f"⏱ {duration}\n\n"
+    "🎧 <b>ASAVED MUSIC</b>"
+)
         await call.answer()
         if thumbnail:
             try:
