@@ -2,423 +2,459 @@
 import os
 import re
 import asyncio
-import logging
-import sqlite3
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
-from contextlib import closing
+
+import aiohttp
+import yt_dlp
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart, Command
-from aiogram.types import (
-    Message, CallbackQuery, Update, InlineKeyboardMarkup,
-    InlineKeyboardButton, FSInputFile
-)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from aiogram.filters import CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup,
+    InlineKeyboardButton, ReplyKeyboardMarkup,
+    KeyboardButton, FSInputFile
+)
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("ASAVED")
-
-# ENVIRONMENT VARIABLES
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-hook").strip("/")
-PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
+JAMENDO_CLIENT_ID = os.getenv("JAMENDO_CLIENT_ID", "")
 PORT = int(os.getenv("PORT", "10000"))
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-DB_PATH = "asaved.sqlite3"
 MAX_SIZE = 45 * 1024 * 1024
 TIMEOUT = 240
-
-ALLOWED_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com",
-    "youtu.be", "music.youtube.com",
-    "tiktok.com", "www.tiktok.com",
-    "vm.tiktok.com", "vt.tiktok.com",
-    "instagram.com", "www.instagram.com",
-    "instagr.am", "www.instagr.am"
-}
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN kiritilmagan")
 
-if len(WEBHOOK_SECRET) < 16:
-    raise RuntimeError("WEBHOOK_SECRET kamida 16 belgi bo‘lsin")
+if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
+    raise RuntimeError("WEBHOOK_SECRET kamida 16 belgidan iborat bo‘lsin")
 
-if not PUBLIC_URL:
-    raise RuntimeError("Render URL topilmadi")
+if not BASE_URL:
+    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi")
 
 bot = Bot(
     BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
-
 dp = Dispatcher()
-download_lock = asyncio.Semaphore(2)
+
+# Foydalanuvchi qidirgan qo'shiqlar
+user_songs = {}
+user_video_urls = {}
+
+menu = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🎵 Musiqa qidirish")],
+        [KeyboardButton(text="📥 Video yuklash")],
+        [KeyboardButton(text="ℹ️ Yordam")]
+    ],
+    resize_keyboard=True
+)
 
 
-# DATABASE
-def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                url TEXT,
-                title TEXT
-            )
-        """)
-        con.commit()
-
-
-def save_job(user_id, url, title):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        cur = con.execute(
-            "INSERT INTO jobs(user_id,url,title) VALUES(?,?,?)",
-            (user_id, url, title)
-        )
-        con.commit()
-        return cur.lastrowid
-
-
-def get_job(job_id, user_id):
-    with closing(sqlite3.connect(DB_PATH)) as con:
-        return con.execute(
-            "SELECT url,title FROM jobs WHERE id=? AND user_id=?",
-            (job_id, user_id)
-        ).fetchone()
-
-
-# URL CHECK
-def valid_url(url):
+def is_video_url(text):
     try:
-        parsed = urlparse(url.strip())
-        host = (parsed.hostname or "").lower()
-
-        return (
-            parsed.scheme in ("http", "https")
-            and host in ALLOWED_HOSTS
+        host = (urlparse(text.strip()).hostname or "").lower()
+        allowed = (
+            "youtube.com", "youtu.be", "youtube-nocookie.com",
+            "instagram.com", "instagr.am",
+            "tiktok.com", "vm.tiktok.com", "vt.tiktok.com"
         )
+        return any(host == d or host.endswith("." + d) for d in allowed)
     except Exception:
         return False
 
 
-# DOWNLOAD
-def download_media(url, folder, audio=False):
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📥 Saqlash",
+                callback_data="save_video"
+            ),
+            InlineKeyboardButton(
+                text="🎵 MP3 olish",
+                callback_data="video_mp3"
+            )
+        ]
+    ])
 
-    output = str(Path(folder) / "%(title).70s-%(id)s.%(ext)s")
 
-    options = {
-        "outtmpl": output,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 25,
-        "retries": 2,
-        "max_filesize": MAX_SIZE,
-        "restrictfilenames": True,
+async def jamendo_search(query):
+    if not JAMENDO_CLIENT_ID:
+        raise RuntimeError("JAMENDO_CLIENT_ID sozlanmagan")
+
+    api_url = "https://api.jamendo.com/v3.0/tracks/"
+
+    params = {
+        "client_id": JAMENDO_CLIENT_ID,
+        "format": "json",
+        "limit": 10,
+        "search": query,
+        "audioformat": "mp32",
+        "include": "musicinfo",
+        "order": "relevance"
     }
 
-    if audio:
-        options.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }]
-        })
-    else:
-        options.update({
-            "format": "best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-        })
+    timeout = aiohttp.ClientTimeout(total=30)
 
-    with YoutubeDL(options) as ydl:
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(api_url, params=params) as response:
+            if response.status != 200:
+                raise RuntimeError("Musiqa qidiruv xizmati javob bermadi")
 
-        info = ydl.extract_info(url, download=True)
-        title = info.get("title") or "ASAVED Media"
+            data = await response.json()
 
-        if audio:
-            filename = Path(ydl.prepare_filename(info)).with_suffix(".mp3")
-        else:
-            filename = Path(ydl.prepare_filename(info))
+    return data.get("results", [])
 
-        if not filename.exists():
-            files = [
-                p for p in Path(folder).iterdir()
-                if p.is_file()
-                and p.suffix.lower() in (
-                    [".mp3"] if audio else [".mp4", ".mkv", ".webm"]
+
+def song_keyboard():
+    rows = []
+
+    for start in range(0, 10, 5):
+        row = []
+        for index in range(start, min(start + 5, 10)):
+            row.append(
+                InlineKeyboardButton(
+                    text=str(index + 1),
+                    callback_data=f"song:{index}"
                 )
+            )
+        rows.append(row)
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(CommandStart())
+async def start(message: Message):
+    await message.answer(
+        "🎧 <b>ASAVED BOT</b>\n\n"
+        "🎵 Qo‘shiq nomi yoki ijrochi ismini yozing.\n"
+        "🔟 Sizga 10 ta musiqa varianti chiqaraman.\n\n"
+        "📥 YouTube, TikTok yoki Instagram havolasini yuboring — "
+        "video yuklab beraman.",
+        reply_markup=menu
+    )
+
+
+@dp.message(F.text == "ℹ️ Yordam")
+async def help_message(message: Message):
+    await message.answer(
+        "🎵 <b>Musiqa:</b> qo‘shiq nomi yoki ijrochini yozing.\n"
+        "📥 <b>Video:</b> YouTube, TikTok yoki Instagram havolasini yuboring.\n"
+        "🎧 <b>MP3:</b> video ostidagi MP3 tugmasini bosing.\n\n"
+        "Faqat yuklashga ruxsatingiz bo‘lgan kontentdan foydalaning."
+    )
+
+
+@dp.message(F.text == "🎵 Musiqa qidirish")
+async def ask_music(message: Message):
+    await message.answer(
+        "🎵 Qo‘shiq nomi yoki ijrochi ismini yozing:"
+    )
+
+
+@dp.message(F.text == "📥 Video yuklash")
+async def ask_video(message: Message):
+    await message.answer("📎 Video havolasini yuboring:")
+
+
+@dp.message(F.text)
+async def text_handler(message: Message):
+    text = message.text.strip()
+
+    if is_video_url(text):
+        await process_video(message, text)
+        return
+
+    if text.startswith("/"):
+        return
+
+    status = await message.answer("🔎 Musiqalar qidirilmoqda...")
+
+    try:
+        results = await jamendo_search(text)
+
+        if not results:
+            await status.edit_text("😕 Hech qanday musiqa topilmadi.")
+            return
+
+        user_songs[message.from_user.id] = results
+
+        lines = ["🎵 <b>Topilgan musiqalar:</b>\n"]
+
+        for i, song in enumerate(results[:10], 1):
+            title = song.get("name", "Noma'lum")
+            artist = song.get("artist_name", "Noma'lum")
+            duration = int(song.get("duration") or 0)
+            minutes, seconds = divmod(duration, 60)
+
+            lines.append(
+                f"<b>{i}.</b> {title} — {artist} "
+                f"<b>{minutes}:{seconds:02d}</b>"
+            )
+
+        lines.append("\n👇 Kerakli raqamni bosing:")
+
+        await status.edit_text(
+            "\n".join(lines),
+            reply_markup=song_keyboard()
+        )
+
+    except Exception as error:
+        print("Music search error:", repr(error))
+        await status.edit_text(
+            "❌ Musiqa qidirishda xatolik.\n"
+            "Jamendo API kalitini tekshiring."
+        )
+
+
+async def process_video(message, url):
+    status = await message.answer("⏳ Video yuklanmoqda...")
+
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            output = str(Path(temp) / "%(id)s.%(ext)s")
+
+            options = {
+                "format": (
+                    "best[ext=mp4][vcodec!=none][acodec!=none]"
+                    "/best[ext=mp4]/best"
+                ),
+                "outtmpl": output,
+                "merge_output_format": "mp4",
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "socket_timeout": 30,
+                "retries": 2,
+                "max_filesize": MAX_SIZE,
+            }
+
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: download_youtube(url, options)
+                ),
+                timeout=TIMEOUT
+            )
+
+            files = [
+                p for p in Path(temp).iterdir()
+                if p.is_file() and p.suffix.lower() not in (".part",)
             ]
 
             if not files:
-                raise RuntimeError("Yuklangan fayl topilmadi")
+                raise RuntimeError("Video fayli topilmadi")
 
-            filename = files[0]
+            filepath = max(files, key=lambda p: p.stat().st_size)
 
-        if filename.stat().st_size > MAX_SIZE:
-            raise RuntimeError("Fayl 45 MB dan katta")
+            if filepath.stat().st_size > MAX_SIZE:
+                raise RuntimeError("Video 45 MB dan katta")
 
-        return str(filename), title
+            user_video_urls[message.from_user.id] = url
 
+            await status.delete()
 
-# START
-@dp.message(CommandStart())
-async def start(message: Message):
+            await message.answer_video(
+                FSInputFile(filepath),
+                caption="📥 <b>ASAVED BOT</b>",
+                reply_markup=main_keyboard(),
+                supports_streaming=True
+            )
 
-    await message.answer(
-        "🎧 <b>ASAVED LINK BOT</b>\n\n"
-        "YouTube, TikTok yoki Instagram havolasini yuboring.\n\n"
-        "🎬 Video Telegram pleerida chiqadi.\n"
-        "🎵 MP3 qilib olish mumkin.\n"
-        "💾 Videoni Telegram orqali saqlash mumkin.\n\n"
-        "Faqat yuklab olishga ruxsat berilgan videolardan foydalaning."
-    )
-
-
-@dp.message(Command("help"))
-async def help_command(message: Message):
-    await message.answer(
-        "📌 <b>Foydalanish:</b>\n\n"
-        "1. YouTube video havolasini yuboring.\n"
-        "2. TikTok havolasini yuboring.\n"
-        "3. Instagram Reels havolasini yuboring.\n\n"
-        "Bot videoni tayyorlab Telegram'ga yuboradi."
-    )
-
-
-# VIDEO DOWNLOAD
-@dp.message(F.text)
-async def video_handler(message: Message):
-
-    url = message.text.strip()
-
-    if not valid_url(url):
-        return await message.answer(
-            "❌ YouTube, TikTok yoki Instagram havolasini yuboring."
+    except asyncio.TimeoutError:
+        await status.edit_text("⌛ Yuklash vaqti tugadi.")
+    except Exception as error:
+        print("Video error:", repr(error))
+        await status.edit_text(
+            "❌ Video yuklanmadi.\n"
+            "Havolani tekshiring yoki keyinroq urinib ko‘ring."
         )
 
-    status = await message.answer(
-        "⏳ <b>Video yuklanmoqda...</b>\n"
-        "Iltimos, kuting."
+
+def download_youtube(url, options):
+    with yt_dlp.YoutubeDL(options) as ydl:
+        ydl.download([url])
+
+
+async def download_audio(url, folder):
+    options = {
+        "format": "bestaudio/best",
+        "outtmpl": str(Path(folder) / "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "max_filesize": MAX_SIZE,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192"
+        }]
+    }
+
+    await asyncio.wait_for(
+        asyncio.to_thread(
+            lambda: download_youtube(url, options)
+        ),
+        timeout=TIMEOUT
     )
 
-    async with download_lock:
+    files = list(Path(folder).glob("*.mp3"))
 
-        with tempfile.TemporaryDirectory() as folder:
+    if not files:
+        raise RuntimeError("MP3 fayli topilmadi")
 
-            try:
-                filepath, title = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        download_media, url, folder, False
-                    ),
-                    timeout=TIMEOUT
-                )
-
-                job_id = save_job(
-                    message.from_user.id,
-                    url,
-                    title
-                )
-
-                username = (await bot.get_me()).username or "ASAVED"
-
-                keyboard = InlineKeyboardMarkup(
-                    inline_keyboard=[
-                        [
-                            InlineKeyboardButton(
-                                text="💾 Saqlash",
-                                callback_data="save"
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                text="🎵 Qo‘shiqni MP3 qilib olish",
-                                callback_data=f"mp3:{job_id}"
-                            )
-                        ],
-                        [
-                            InlineKeyboardButton(
-                                text="Guruhga qo‘shish ↗️",
-                                url=f"https://t.me/{username}?startgroup=true"
-                            )
-                        ]
-                    ]
-                )
-
-                await message.answer_video(
-                    video=FSInputFile(filepath),
-                    caption=(
-                        f"📥 <b>@{username}</b> orqali yuklab olindi"
-                    ),
-                    supports_streaming=True,
-                    reply_markup=keyboard
-                )
-
-                await status.delete()
-
-            except asyncio.TimeoutError:
-                await status.edit_text(
-                    "⌛ Yuklash vaqti tugadi. Keyinroq urinib ko‘ring."
-                )
-
-            except DownloadError:
-                log.exception("Download error")
-                await status.edit_text(
-                    "❌ Video olinmadi. Havola ochiq ekanini tekshiring."
-                )
-
-            except Exception:
-                log.exception("Video error")
-                await status.edit_text(
-                    "❌ Xatolik yuz berdi.\n"
-                    "Video katta, yopiq yoki sayt tomonidan qo‘llanmayotgan bo‘lishi mumkin."
-                )
+    return files[0]
 
 
-# SAVE BUTTON
-@dp.callback_query(F.data == "save")
-async def save_button(call: CallbackQuery):
+async def download_jamendo_song(song):
+    url = song.get("audiodownload")
 
-    await call.answer(
-        "Videoni telefoningizga saqlash uchun video ichidagi yuklab olish belgisini bosing.",
+    if not url:
+        raise RuntimeError(
+            "Bu qo‘shiq uchun ruxsat etilgan MP3 yuklash havolasi yo‘q"
+        )
+
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "music.mp3"
+        timeout = aiohttp.ClientTimeout(total=120)
+
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise RuntimeError("MP3 yuklab bo‘lmadi")
+
+                total = 0
+                with open(path, "wb") as file:
+                    async for chunk in response.content.iter_chunked(65536):
+                        total += len(chunk)
+                        if total > MAX_SIZE:
+                            raise RuntimeError("MP3 fayli juda katta")
+                        file.write(chunk)
+
+        if path.stat().st_size == 0:
+            raise RuntimeError("Bo‘sh MP3 fayli")
+
+        # Fayl yuborilguncha vaqtinchalik papka o‘chmasligi kerak.
+        yield path
+
+
+@dp.callback_query(F.data.startswith("song:"))
+async def select_song(callback: CallbackQuery):
+    try:
+        index = int(callback.data.split(":")[1])
+        songs = user_songs.get(callback.from_user.id, [])
+
+        if index < 0 or index >= len(songs):
+            await callback.answer("Qidiruvni qayta bajaring.", show_alert=True)
+            return
+
+        song = songs[index]
+        await callback.answer("MP3 tayyorlanmoqda...")
+
+        async for path in download_jamendo_song(song):
+            await callback.message.answer_audio(
+                FSInputFile(path),
+                title=song.get("name", "Music"),
+                performer=song.get("artist_name", "Unknown"),
+                caption="🎵 <b>ASAVED BOT</b>"
+            )
+
+    except Exception as error:
+        print("Song download error:", repr(error))
+        await callback.message.answer(
+            "❌ Bu musiqani MP3 qilib yuklab bo‘lmadi. "
+            "Boshqa qo‘shiqni tanlang."
+        )
+
+
+@dp.callback_query(F.data == "save_video")
+async def save_video(callback: CallbackQuery):
+    await callback.answer(
+        "Videoni Telegramdagi yuklab olish tugmasi orqali saqlang.",
         show_alert=True
     )
 
 
-# MP3 BUTTON
-@dp.callback_query(F.data.startswith("mp3:"))
-async def mp3_button(call: CallbackQuery):
+@dp.callback_query(F.data == "video_mp3")
+async def video_mp3(callback: CallbackQuery):
+    url = user_video_urls.get(callback.from_user.id)
+
+    if not url:
+        await callback.answer("Avval video yuboring.", show_alert=True)
+        return
+
+    await callback.answer("MP3 tayyorlanmoqda...")
+
+    status = await callback.message.answer("🎧 Audio ajratilmoqda...")
 
     try:
-        job_id = int(call.data.split(":")[1])
-    except Exception:
-        return await call.answer("Noto‘g‘ri so‘rov", show_alert=True)
+        with tempfile.TemporaryDirectory() as folder:
+            path = await download_audio(url, folder)
 
-    job = get_job(job_id, call.from_user.id)
+            await callback.message.answer_audio(
+                FSInputFile(path),
+                caption="🎵 <b>ASAVED BOT</b>"
+            )
 
-    if not job:
-        return await call.answer(
-            "Havola topilmadi. Qayta yuboring.",
-            show_alert=True
+        await status.delete()
+
+    except Exception as error:
+        print("Audio extraction error:", repr(error))
+        await status.edit_text(
+            "❌ MP3 tayyorlanmadi. Keyinroq urinib ko‘ring."
         )
 
-    url, title = job
 
-    await call.answer("MP3 tayyorlanmoqda")
-
-    status = await call.message.answer(
-        "🎵 <b>MP3 tayyorlanmoqda...</b>"
-    )
-
-    async with download_lock:
-
-        with tempfile.TemporaryDirectory() as folder:
-
-            try:
-                filepath, audio_title = await asyncio.wait_for(
-                    asyncio.to_thread(
-                        download_media, url, folder, True
-                    ),
-                    timeout=TIMEOUT
-                )
-
-                await call.message.answer_audio(
-                    audio=FSInputFile(filepath),
-                    title=audio_title[:64],
-                    caption=f"🎵 <b>{audio_title}</b>"
-                )
-
-                await status.delete()
-
-            except Exception:
-                log.exception("MP3 error")
-                await status.edit_text(
-                    "❌ MP3 tayyorlab bo‘lmadi."
-                )
-
-
-# HEALTH CHECK
 async def health(request):
-
-    return web.json_response({
-        "status": "ok",
-        "bot": "ASAVED"
-    })
+    return web.json_response({"status": "ok", "bot": "ASAVED"})
 
 
-# WEBHOOK
-async def webhook(request):
-
-    secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token"
-    )
-
-    if secret != WEBHOOK_SECRET:
+async def telegram_webhook(request):
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         raise web.HTTPUnauthorized()
 
     try:
-        data = await request.json()
-        update = Update.model_validate(data)
-        await dp.feed_update(bot, update)
-
-    except Exception:
-        log.exception("Webhook update error")
+        update = await request.json()
+        from aiogram.types import Update
+        telegram_update = Update.model_validate(
+            update, context={"bot": bot}
+        )
+        await dp.feed_update(bot, telegram_update)
+    except Exception as error:
+        print("Webhook error:", repr(error))
 
     return web.Response(text="OK")
 
 
-# SERVER
-async def main():
-
-    init_db()
-
-    webhook_url = (
-        f"{PUBLIC_URL.rstrip('/')}/{WEBHOOK_PATH}"
-    )
-
+async def on_startup(app):
     await bot.set_webhook(
-        webhook_url,
+        url=f"{BASE_URL}/{WEBHOOK_PATH}",
         secret_token=WEBHOOK_SECRET,
-        allowed_updates=dp.resolve_used_update_types()
+        drop_pending_updates=True
     )
+    print("ASAVED webhook started")
 
-    app = web.Application()
 
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_post(
-        f"/{WEBHOOK_PATH}",
-        webhook
-    )
+async def on_shutdown(app):
+    await bot.delete_webhook()
+    await bot.session.close()
 
-    runner = web.AppRunner(app)
-    await runner.setup()
 
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT
-    )
-
-    await site.start()
-
-    logging.info("ASAVED BOT IS RUNNING")
-
-    try:
-        await asyncio.Event().wait()
-
-    finally:
-        await runner.cleanup()
-        await bot.session.close()
+app = web.Application(client_max_size=2 * 1024 * 1024)
+app.router.add_get("/", health)
+app.router.add_get("/health", health)
+app.router.add_post(f"/{WEBHOOK_PATH}", telegram_webhook)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_shutdown)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    web.run_app(app, host="0.0.0.0", port=PORT)
