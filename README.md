@@ -1,38 +1,50 @@
+ASAVED PRO Telegram Bot
 
-# ASAVED Telegram Bot
+Funksiyalar
 
-ASAVED — video bilan ishlash uchun Telegram bot.
+• Til tanlash: O‘zbekcha / Русский / English
+• @akoshsaved kanaliga obuna tekshiruvi (PRO foydalanuvchilarga tatbiq etilmaydi)
+• Dumaloq video
+• Video havolasi: YouTube / Instagram / TikTok (ochiq va ruxsat etilgan kontent)
+• 9:16 format
+• PRO: Instagram video audio trekini MP3 sifatida ajratish
+• 7 kun: 30 000 so‘m; 30 kun: 55 000 so‘m
+• Chekni admin ko‘rib chiqadi; tasdiqlangach PRO avtomatik faollashadi
+• Admin Telegram ID kodi ichida sozlangan
 
-## Bot funksiyalari
+GitHub fayllari
 
-1. 🎥 Dumaloq video — galereyadan yuborilgan videoni Telegram dumaloq videosiga aylantiradi.
-2. 🔗 Video havolasi — YouTube, Instagram va TikTok havolalaridan ochiq videolarni oladi.
-3. 📱 9:16 format — videoni vertikal formatga o‘zgartiradi.
+app.py, requirements.txt, Dockerfile, README.md
 
-## O‘rnatish
+Render sozlamalari
 
-GitHub loyihasida quyidagi fayllar bo‘lishi kerak:
+Docker Web Service ishlating. Environment Variables:
 
-- app.py
-- requirements.txt
-- Dockerfile
-- README.md
+• BOT_TOKEN — BotFather token
+• WEBHOOK_SECRET — kamida 16 belgi, A-Z/a-z/0-9/_/-
+• WEBHOOK_PATH — asaved-webhook
+• PAYMENT_CARD — to‘lov kartasi raqami
+• PAYMENT_HOLDER — karta egasining ko‘rsatiladigan ismi
 
-## Render sozlamalari
+Render avtomatik PORT va RENDER_EXTERNAL_URL beradi.
 
-Render'da Docker Web Service yarating.
+MUHIM: ma’lumotlar bazasi
 
-Environment Variables:
+Render servisida Persistent Disk yarating:
 
-- BOT_TOKEN
-- WEBHOOK_SECRET
-- WEBHOOK_PATH = asaved-webhook
+• Mount Path: /data
+• Size: loyihangizga mos (masalan 1 GB)
 
-PORT va RENDER_EXTERNAL_URL Render tomonidan avtomatik beriladi.
+Bot obunalar va to‘lovlarni /data/asaved.sqlite3 da saqlaydi. Persistent Disk bo‘lmasa deploy/restart paytida ma’lumotlar yo‘qolishi mumkin.
 
-## Eslatma
+Telegram kanal
 
-- Galereyadan yuboriladigan video 20 MB dan oshmasin.
-- Dumaloq video 60 soniyagacha.
-- Video havolalari ochiq bo‘lishi va yuklab olishga ruxsat berilgan bo‘lishi kerak.
-- Platforma cheklovlari sabab ayrim havolalar ishlamasligi mumkin.
+@akoshsaved kanalida botni administrator qiling. Aks holda obunani tekshirish ishlamasligi mumkin.
+
+To‘lov xavfsizligi
+
+Chek rasmi to‘lovning o‘zi emas. Admin bank ilovasidan pul tushganini tekshirib, shundan keyingina tasdiqlasin. Karta ma’lumotlarini faqat Render Environment Variables ichida kiriting, GitHub kodiga yozmang.
+
+Kontent
+
+Havoladan faqat ochiq va yuklab olishga, audiosidan foydalanishga ruxsat berilgan kontentni oling. Login/cookie, yopiq profil yoki himoya cheklovlarini chetlab o‘tish qo‘llanmaydi.
