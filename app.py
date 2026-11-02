@@ -7,45 +7,30 @@ import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
-import yt_dlp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    Video, Document, ReplyKeyboardRemove, FSInputFile
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-
-# -------------------- CONFIG --------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip().strip("/")
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))
-
-# Telegram cloud Bot API can download files up to 20 MB.
-MAX_INPUT_BYTES = 20 * 1024 * 1024
-MAX_OUTPUT_BYTES = 49 * 1024 * 1024
-MAX_VIDEO_SECONDS = 60 * 10
-ALLOWED_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
-    "instagram.com", "www.instagram.com"
-}
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("asaved")
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
+PORT = int(os.getenv("PORT", "10000"))
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment'ga kiritilmagan")
-if not WEBHOOK_SECRET or len(WEBHOOK_SECRET) < 16:
-    raise RuntimeError("WEBHOOK_SECRET kamida 16 belgidan iborat bo'lishi kerak")
-if not re.fullmatch(r"[A-Za-z0-9_-]+", WEBHOOK_SECRET):
-    raise RuntimeError("WEBHOOK_SECRET faqat A-Z, a-z, 0-9, _ va - belgilaridan iborat bo'lsin")
+    raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
+if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
+    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin; faqat harf, raqam, _ yoki - ishlating")
 if not BASE_URL:
     raise RuntimeError("RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring")
 
@@ -54,360 +39,227 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# Per-user temporary workflow state. Files are removed after processing.
-user_modes = {}
-pending_links = {}
+BTN_ROUND = "🎥 Dumaloq video"
+BTN_LINK = "🔗 Video havolasi"
+BTN_916 = "📱 9:16 format"
 
-MAIN_KB = ReplyKeyboardMarkup(
+keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🎥 Dumaloq video"), KeyboardButton(text="⬇️ Video havolasi")],
-        [KeyboardButton(text="📱 9:16 format"), KeyboardButton(text="📦 Hajmini kichraytirish")],
-        [KeyboardButton(text="🔄 MP4 format"), KeyboardButton(text="✂️ Videoni kesish")],
-        [KeyboardButton(text="🎵 Videodan MP3"), KeyboardButton(text="ℹ️ Yordam")]
+        [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
+        [KeyboardButton(text=BTN_LINK)],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Bo'limni tanlang yoki video yuboring..."
+    input_field_placeholder="Kerakli funksiyani tanlang"
 )
 
-def cancel_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")]
-    ])
+# Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
+user_modes: dict[int, str] = {}
 
-def authorized_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Davom etish", callback_data="link_ok")],
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel")]
-    ])
+ALLOWED_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+    "instagram.com", "www.instagram.com",
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+}
 
-def safe_filename(name: str) -> str:
-    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "video")
-    return name[:80] or "video"
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # Telegram cloud Bot API getFile cheklovi
+MAX_OUTPUT_BYTES = 49 * 1024 * 1024
+MAX_LINK_BYTES = 49 * 1024 * 1024
+MAX_SECONDS = 600
 
-def valid_platform_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        return parsed.scheme in ("http", "https") and any(
-            host == domain or host.endswith("." + domain)
-            for domain in ALLOWED_HOSTS
-        )
-    except Exception:
-        return False
+def main_text() -> str:
+    return (
+        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
+        "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
+        "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
+        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n\n"
+        "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
+    )
 
-async def run_ffmpeg(args):
+@router.message(CommandStart())
+async def start(message: Message):
+    user_modes.pop(message.from_user.id, None)
+    await message.answer(main_text(), reply_markup=keyboard)
+
+@router.message(F.text == BTN_ROUND)
+async def choose_round(message: Message):
+    user_modes[message.from_user.id] = "round"
+    await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
+
+@router.message(F.text == BTN_916)
+async def choose_916(message: Message):
+    user_modes[message.from_user.id] = "916"
+    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
+
+@router.message(F.text == BTN_LINK)
+async def choose_link(message: Message):
+    user_modes[message.from_user.id] = "link"
+    await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
+def get_video_info(message: Message):
+    if message.video:
+        return message.video.file_id, message.video.file_size, message.video.duration, "video.mp4"
+    if message.document and (message.document.mime_type or "").startswith("video/"):
+        return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
+    return None
+
+async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
+    info = get_video_info(message)
+    if not info:
+        raise ValueError("Video topilmadi. Iltimos, video fayl yuboring.")
+    file_id, size, duration, filename = info
+    if size and size > MAX_UPLOAD_BYTES:
+        raise ValueError("Video 20 MB dan katta. Telegram bot orqali bunday faylni olish imkoni yo‘q; kichikroq video yuboring.")
+    if duration and duration > MAX_SECONDS:
+        raise ValueError("Video 10 daqiqadan uzun. Qisqaroq video yuboring.")
+    tg_file = await bot.get_file(file_id)
+    await bot.download_file(tg_file.file_path, destination=target)
+    return target, duration
+
+async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *args,
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
 
-async def get_video_file(message: Message, folder: Path) -> Path:
-    media = message.video
-    if not media and message.document and (message.document.mime_type or "").startswith("video/"):
-        media = message.document
-    if not media:
-        raise ValueError("Iltimos, video fayl yuboring.")
-    size = media.file_size or 0
-    if size > MAX_INPUT_BYTES:
-        raise ValueError("Video 20 MB dan katta. Hozircha 20 MB gacha bo'lgan video yuboring.")
-    if not media.file_id:
-        raise ValueError("Video faylini o'qib bo'lmadi.")
-    file = await bot.get_file(media.file_id)
-    if not file.file_path:
-        raise ValueError("Telegram fayl manzilini qaytarmadi.")
-    out = folder / "input_video"
-    await bot.download_file(file.file_path, destination=out)
-    if not out.exists() or out.stat().st_size == 0:
-        raise ValueError("Video yuklab olinmadi.")
-    return out
+async def make_round(src: Path, dst: Path):
+    # Telegram video note kvadrat bo‘lishi va 60 soniyadan oshmasligi kerak.
+    await run_ffmpeg([
+        "-i", str(src),
+        "-t", "60",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-movflags", "+faststart", str(dst)
+    ])
 
-async def probe_duration(path: Path) -> float:
-    proc = await asyncio.create_subprocess_exec(
-        "ffprobe", "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(path),
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, _ = await proc.communicate()
+async def make_916(src: Path, dst: Path):
+    # 9:16 portret: kadr markazidan crop qilinadi, qora chetlar qo‘shilmaydi.
+    await run_ffmpeg([
+        "-i", str(src),
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", str(dst)
+    ])
+
+async def process_uploaded_video(message: Message, mode: str):
+    status = await message.answer("⏳ Video tayyorlanmoqda...")
     try:
-        return float(stdout.decode().strip())
-    except Exception:
-        return 0.0
-
-async def send_result(message: Message, path: Path, caption: str):
-    size = path.stat().st_size
-    if size > MAX_OUTPUT_BYTES:
-        await message.answer("Tayyor fayl 49 MB dan katta chiqdi. Qisqaroq yoki kichikroq video yuboring.")
-        return
-    await message.answer_document(FSInputFile(path), caption=caption)
-
-async def process_video(message: Message, mode: str, trim_range=None):
-    status = await message.answer("⏳ Video qayta ishlanmoqda...")
-    try:
-        with tempfile.TemporaryDirectory(prefix="asaved_") as temp:
-            folder = Path(temp)
-            source = await get_video_file(message, folder)
-            duration = await probe_duration(source)
-            if duration and duration > MAX_VIDEO_SECONDS:
-                raise ValueError("Video 10 daqiqadan uzun. Iltimos, qisqaroq video yuboring.")
-
-            output = folder / "result.mp4"
-            if mode == "circle":
-                # Telegram video note: square 1:1, H.264, max 60 sec.
-                if duration > 60:
-                    raise ValueError("Dumaloq video Telegram'da 60 soniyagacha bo'lishi kerak.")
-                await run_ffmpeg([
-                    "-i", str(source), "-t", "60",
-                    "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,fps=30",
-                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
-                    "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k",
-                    "-movflags", "+faststart", str(output)
-                ])
-                await status.delete()
-                await message.answer_video_note(FSInputFile(output))
-                return
-
-            if mode == "vertical":
-                vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,fps=30"
-                args = ["-i", str(source), "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
-                        "-crf", "26", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-                        "-movflags", "+faststart", str(output)]
-                caption = "✅ Video 9:16 formatga o'tkazildi."
-            elif mode == "compress":
-                args = ["-i", str(source), "-c:v", "libx264", "-preset", "veryfast",
-                        "-crf", "29", "-c:a", "aac", "-b:a", "80k", "-movflags", "+faststart", str(output)]
-                caption = "✅ Video hajmi kichraytirildi."
-            elif mode == "mp4":
-                args = ["-i", str(source), "-c:v", "libx264", "-preset", "veryfast",
-                        "-crf", "25", "-pix_fmt", "yuv420p", "-c:a", "aac",
-                        "-movflags", "+faststart", str(output)]
-                caption = "✅ Video MP4 formatga o'tkazildi."
-            elif mode == "trim":
-                start, end = trim_range
-                args = ["-ss", start, "-i", str(source), "-to", end, "-c:v", "libx264",
-                        "-preset", "veryfast", "-crf", "25", "-c:a", "aac",
-                        "-movflags", "+faststart", str(output)]
-                caption = "✅ Video kesildi."
-            elif mode == "audio":
-                audio = folder / "audio.mp3"
-                await run_ffmpeg(["-i", str(source), "-vn", "-codec:a", "libmp3lame",
-                                  "-q:a", "4", str(audio)])
-                await status.delete()
-                if audio.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError("MP3 fayl juda katta chiqdi.")
-                await message.answer_audio(FSInputFile(audio), caption="🎵 Videodan audio ajratildi.")
-                return
+        with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
+            folder = Path(tmp)
+            src = folder / "input_video"
+            dst = folder / "output.mp4"
+            await download_telegram_video(message, src)
+            if mode == "round":
+                await make_round(src, dst)
+                if dst.stat().st_size > MAX_OUTPUT_BYTES:
+                    raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
+                await message.answer_video_note(FSInputFile(dst))
             else:
-                raise ValueError("Noma'lum amal.")
-
-            await run_ffmpeg(args)
-            await status.delete()
-            await send_result(message, output, caption)
-    except ValueError as e:
-        await status.edit_text(f"⚠️ {e}")
-    except (TelegramBadRequest, TelegramNetworkError) as e:
-        log.exception("Telegram media error")
-        await status.edit_text("❌ Telegram faylni qabul qila olmadi. Video hajmini kamaytirib qayta urinib ko'ring.")
-    except Exception:
+                await make_916(src, dst)
+                if dst.stat().st_size > MAX_OUTPUT_BYTES:
+                    raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
+                await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
+        await status.delete()
+    except Exception as exc:
         log.exception("Video processing failed")
-        await status.edit_text("❌ Videoni qayta ishlashda xatolik. Boshqa video bilan urinib ko'ring.")
+        await status.edit_text(f"❌ Xatolik: {str(exc)[:700]}")
+    finally:
+        user_modes.pop(message.from_user.id, None)
 
-@router.message(CommandStart())
-async def start(message: Message):
-    user_modes.pop(message.from_user.id, None)
-    await message.answer(
-        "👋 <b>ASAVED BOT</b>ga xush kelibsiz!\n\n"
-        "Videoni qayta ishlash uchun kerakli bo'limni tanlang. "
-        "Yoki galereyadan video yuboring va avval bo'limni tanlang.",
-        reply_markup=MAIN_KB
-    )
+def valid_video_url(raw: str) -> bool:
+    try:
+        parsed = urlparse(raw.strip())
+        host = (parsed.hostname or "").lower()
+        return parsed.scheme == "https" and (host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS))
+    except Exception:
+        return False
 
-@router.message(Command("help"))
-@router.message(F.text == "ℹ️ Yordam")
-async def help_message(message: Message):
-    await message.answer(
-        "<b>ASAVED imkoniyatlari</b>\n"
-        "🎥 Dumaloq video — videoni Telegram video note qiladi (60 soniyagacha).\n"
-        "📱 9:16 — vertikal formatga moslaydi.\n"
-        "📦 Hajmini kichraytirish — video hajmini kamaytiradi.\n"
-        "🔄 MP4 — MP4/H.264 formatga o'tkazadi.\n"
-        "✂️ Kesish — vaqt oralig'ini kiritib videoni kesadi.\n"
-        "🎵 MP3 — o'zingiz yuborgan videodan audio ajratadi.\n"
-        "⬇️ Video havolasi — faqat o'zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolar.\n\n"
-        "Limit: Telegram orqali 20 MB gacha video yuboring. "
-        "Maxfiy, pullik, DRM bilan himoyalangan yoki ruxsatsiz kontent yuklanmaydi.",
-        reply_markup=MAIN_KB
-    )
+async def download_public_link(url: str, folder: Path) -> Path:
+    # yt-dlp public, ruxsat etilgan kontent uchungina ishlatiladi.
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
 
-@router.callback_query(F.data == "cancel")
-async def cancel(callback: CallbackQuery):
-    pending_links.pop(callback.from_user.id, None)
-    user_modes.pop(callback.from_user.id, None)
-    await callback.answer("Bekor qilindi")
-    if callback.message:
-        await callback.message.edit_text("Bekor qilindi. Bosh menyudan bo'lim tanlang.")
-
-@router.message(F.text == "🎥 Dumaloq video")
-async def circle_mode(message: Message):
-    user_modes[message.from_user.id] = ("circle", None)
-    await message.answer("Galereyangizdan 60 soniyagacha video yuboring. Men uni dumaloq video qilib qaytaraman.", reply_markup=cancel_kb())
-
-@router.message(F.text == "📱 9:16 format")
-async def vertical_mode(message: Message):
-    user_modes[message.from_user.id] = ("vertical", None)
-    await message.answer("9:16 formatga o'tkazish uchun videoni yuboring.", reply_markup=cancel_kb())
-
-@router.message(F.text == "📦 Hajmini kichraytirish")
-async def compress_mode(message: Message):
-    user_modes[message.from_user.id] = ("compress", None)
-    await message.answer("Hajmini kichraytirish uchun videoni yuboring.", reply_markup=cancel_kb())
-
-@router.message(F.text == "🔄 MP4 format")
-async def mp4_mode(message: Message):
-    user_modes[message.from_user.id] = ("mp4", None)
-    await message.answer("MP4 formatga o'tkazish uchun videoni yuboring.", reply_markup=cancel_kb())
-
-@router.message(F.text == "🎵 Videodan MP3")
-async def audio_mode(message: Message):
-    user_modes[message.from_user.id] = ("audio", None)
-    await message.answer("Audio ajratish uchun o'zingiz yuborgan videoni jo'nating.", reply_markup=cancel_kb())
-
-@router.message(F.text == "✂️ Videoni kesish")
-async def trim_mode(message: Message):
-    user_modes[message.from_user.id] = ("trim_wait_time", None)
-    await message.answer(
-        "Avval vaqt oralig'ini shu ko'rinishda yuboring:\n<code>00:00:05-00:00:20</code>\n\n"
-        "Bu 5-soniyadan 20-soniyagacha kesadi. Keyin videoni yuboring.",
-        reply_markup=cancel_kb()
-    )
-
-@router.message(F.text == "⬇️ Video havolasi")
-async def link_mode(message: Message):
-    user_modes[message.from_user.id] = ("link_wait", None)
-    await message.answer(
-        "YouTube, TikTok yoki Instagram'dagi videoning havolasini yuboring.\n\n"
-        "Faqat o'zingiz yaratgan yoki yuklab olishga aniq ruxsatingiz bo'lgan videolar uchun. "
-        "Maxfiy, login talab qiladigan, DRM/protected kontentni yuklab olish qo'llab-quvvatlanmaydi.",
-        reply_markup=cancel_kb()
-    )
-
-@router.message(F.video | F.document)
-async def video_received(message: Message):
-    uid = message.from_user.id
-    mode_data = user_modes.get(uid)
-    if not mode_data:
-        await message.answer("Avval menyudan kerakli bo'limni tanlang.", reply_markup=MAIN_KB)
-        return
-    mode, extra = mode_data
-    if mode == "trim_wait_time":
-        await message.answer("Avval vaqt oralig'ini yuboring, masalan 00:00:05-00:00:20.")
-        return
-    if mode == "link_wait":
-        await message.answer("Bu bo'limda video havolasi kerak. Havolani matn ko'rinishida yuboring.")
-        return
-    if mode == "trim":
-        user_modes.pop(uid, None)
-        await process_video(message, "trim", extra)
-    elif mode in {"circle", "vertical", "compress", "mp4", "audio"}:
-        user_modes.pop(uid, None)
-        await process_video(message, mode)
-    else:
-        await message.answer("Menyudan bo'lim tanlang.", reply_markup=MAIN_KB)
+    output_template = str(folder / "link_video.%(ext)s")
+    options = {
+        "format": "best[ext=mp4][height<=1080]/best[height<=1080]/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "max_filesize": MAX_LINK_BYTES,
+        "socket_timeout": 25,
+        "retries": 2,
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+    }
+    def do_download():
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+    await asyncio.to_thread(do_download)
+    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
+    if not files:
+        raise RuntimeError("Video topilmadi yoki platforma yuklashga ruxsat bermadi.")
+    result = max(files, key=lambda p: p.stat().st_size)
+    if result.stat().st_size > MAX_LINK_BYTES:
+        raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
+    return result
 
 @router.message(F.text)
-async def text_router(message: Message):
-    uid = message.from_user.id
-    mode_data = user_modes.get(uid)
-    if not mode_data:
-        return
-    mode, extra = mode_data
+async def handle_text(message: Message):
     text = (message.text or "").strip()
+    mode = user_modes.get(message.from_user.id)
 
-    if mode == "trim_wait_time":
-        match = re.fullmatch(r"(\d{2}:\d{2}:\d{2})\s*-\s*(\d{2}:\d{2}:\d{2})", text)
-        if not match:
-            await message.answer("Vaqt formati noto'g'ri. Masalan: <code>00:00:05-00:00:20</code>")
+    if mode == "link":
+        if not valid_video_url(text):
+            await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
             return
-        def to_seconds(t):
-            h, m, s = map(int, t.split(":"))
-            return h * 3600 + m * 60 + s
-        start, end = match.groups()
-        if to_seconds(end) <= to_seconds(start):
-            await message.answer("Tugash vaqti boshlanish vaqtidan keyin bo'lishi kerak.")
-            return
-        user_modes[uid] = ("trim", (start, end))
-        await message.answer("Endi kesiladigan videoni yuboring.", reply_markup=cancel_kb())
-        return
-
-    if mode == "link_wait":
-        if not valid_platform_url(text):
-            await message.answer("Faqat YouTube, TikTok yoki Instagram havolasini yuboring.")
-            return
-        pending_links[uid] = text
-        await message.answer(
-            "⚠️ Tasdiqlang: bu video o'zingizga tegishli yoki uni yuklab olish uchun ruxsatingiz bor. "
-            "Men maxfiy, login talab qiladigan yoki himoyani aylanib o'tishni talab qiladigan videolarni yuklamayman.",
-            reply_markup=authorized_kb()
-        )
-        return
-
-@router.callback_query(F.data == "link_ok")
-async def link_confirm(callback: CallbackQuery):
-    uid = callback.from_user.id
-    url = pending_links.pop(uid, None)
-    if not url:
-        await callback.answer("Havola topilmadi. Qayta yuboring.", show_alert=True)
-        return
-    await callback.answer("Yuklash boshlandi")
-    status = await callback.message.answer("⏳ Ruxsat etilgan video yuklanmoqda...")
-    try:
-        with tempfile.TemporaryDirectory(prefix="asaved_link_") as temp:
-            folder = Path(temp)
-            outtmpl = str(folder / "%(title).60s.%(ext)s")
-            opts = {
-                "outtmpl": outtmpl,
-                "format": "best[ext=mp4]/best",
-                "merge_output_format": "mp4",
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "socket_timeout": 20,
-                "retries": 1,
-                "max_filesize": MAX_OUTPUT_BYTES,
-                "restrictfilenames": True,
-                "nocheckcertificate": False,
-                "ignoreerrors": False,
-            }
-            # Do not pass cookies, credentials, or browser sessions.
-            loop = asyncio.get_running_loop()
-            def download():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    ydl.download([url])
-            await asyncio.wait_for(loop.run_in_executor(None, download), timeout=150)
-            files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {".mp4", ".mkv", ".webm", ".mov"}]
-            if not files:
-                raise RuntimeError("Yuklab olinadigan ruxsat etilgan video topilmadi.")
-            file = max(files, key=lambda p: p.stat().st_size)
-            if file.stat().st_size > MAX_OUTPUT_BYTES:
-                raise RuntimeError("Video 49 MB dan katta. Qisqaroq video tanlang.")
+        status = await message.answer("⏳ Havola tekshirilmoqda va video olinmoqda...")
+        try:
+            with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
+                video_path = await download_public_link(text, Path(tmp))
+                await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
             await status.delete()
-            await callback.message.answer_video(FSInputFile(file), caption="✅ Video tayyor.")
-    except asyncio.TimeoutError:
-        await status.edit_text("⏱ Yuklash vaqti tugadi. Keyinroq yoki boshqa havola bilan urinib ko'ring.")
-    except Exception as e:
-        log.warning("Link download failed: %s", e)
-        await status.edit_text(
-            "❌ Bu havoladagi videoni olishning imkoni bo'lmadi. "
-            "Video ochiq va yuklab olishga ruxsat berilganini tekshiring yoki videoni galereyadan yuboring."
-        )
+        except Exception as exc:
+            log.exception("Link download failed")
+            await status.edit_text(
+                "❌ Videoni olib bo‘lmadi.\n"
+                "Sabab: havola yopiq bo‘lishi, platforma cheklovi yoki video hajmi bo‘lishi mumkin.\n"
+                "O‘zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko‘ring."
+            )
+        finally:
+            user_modes.pop(message.from_user.id, None)
+        return
+
+    if mode in ("round", "916"):
+        await message.answer("Iltimos, havola emas, galereyadan video fayl yuboring.")
+        return
+
+    if valid_video_url(text):
+        await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
+    else:
+        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+
+@router.message(F.video | F.document)
+async def handle_video(message: Message):
+    mode = user_modes.get(message.from_user.id)
+    if mode not in ("round", "916"):
+        await message.answer("Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang.")
+        return
+    if not get_video_info(message):
+        await message.answer("Iltimos, video fayl yuboring.")
+        return
+    await process_uploaded_video(message, mode)
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer("Menyudan kerakli bo'limni tanlang.", reply_markup=MAIN_KB)
+    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
-async def on_startup(app: web.Application):
+async def on_startup():
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
@@ -417,21 +269,29 @@ async def on_startup(app: web.Application):
     )
     log.info("Webhook set: %s", webhook_url)
 
-async def on_shutdown(app: web.Application):
+async def on_shutdown():
     await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
 
-def main():
-    app = web.Application()
-    app.on_startup.append(on_startup)
-    app.on_shutdown.append(on_shutdown)
+async def main():
+    app = web.Application(client_max_size=2 * 1024 * 1024)
+    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
+    app.router.add_get("/health", lambda request: web.Response(text="ok"))
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
         secret_token=WEBHOOK_SECRET
     ).register(app, path=f"/{WEBHOOK_PATH}")
     setup_application(app, dp, bot=bot)
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    app.on_startup.append(lambda app: on_startup())
+    app.on_cleanup.append(lambda app: on_shutdown())
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("ASAVED listening on port %s", PORT)
+    # Render Web Service processini faol ushlab turish.
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
