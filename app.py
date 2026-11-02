@@ -1,5 +1,4 @@
 
-import asyncio
 import logging
 import os
 import tempfile
@@ -28,9 +27,9 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "10000"))
 
-# O'zingning kanaling ma'lumotlarini kiriting
-CHANNEL_ID = os.getenv("CHANNEL_ID", "@kanal_username")
-CHANNEL_URL = os.getenv("CHANNEL_URL", "https://t.me/kanal_username")
+# KANAL SOZLAMALARI
+CHANNEL_ID = "@ReklamaBozoriUzz"
+CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 
 MAX_SIZE = 45 * 1024 * 1024
 
@@ -57,7 +56,7 @@ TEXTS = {
         "processing": "⏳ Video tayyorlanmoqda...",
         "done": "✅ Video tayyor!",
         "error": "❌ Video bilan ishlashda xatolik yuz berdi.",
-        "subscribe": "📢 Botdan foydalanish uchun kanalimizga obuna bo'ling.",
+        "subscribe": "📢 Botdan foydalanish uchun avval kanalimizga obuna bo'ling.",
         "check": "✅ Obunani tekshirish",
         "not_sub": "❌ Siz hali kanalga obuna bo'lmagansiz.",
         "language": "🌐 Tilni tanlang:",
@@ -66,19 +65,19 @@ TEXTS = {
     },
     "ru": {
         "welcome": "👋 Добро пожаловать в ASAVED!",
-        "choose": "Выберите нужную услугу:",
+        "choose": "Выберите услугу:",
         "round": "⭕ Круглое видео",
         "vertical": "📱 Формат 9:16",
         "send_round": "Отправьте видео для круглого формата.",
         "send_vertical": "Отправьте видео для формата 9:16.",
         "processing": "⏳ Обрабатываем видео...",
         "done": "✅ Видео готово!",
-        "error": "❌ Ошибка при обработке видео.",
-        "subscribe": "📢 Подпишитесь на канал, чтобы пользоваться ботом.",
+        "error": "❌ Ошибка обработки видео.",
+        "subscribe": "📢 Сначала подпишитесь на наш канал.",
         "check": "✅ Проверить подписку",
-        "not_sub": "❌ Вы ещё не подписались на канал.",
+        "not_sub": "❌ Вы ещё не подписались.",
         "language": "🌐 Выберите язык:",
-        "size": "❌ Размер видео не должен превышать 45 МБ.",
+        "size": "❌ Видео не должно превышать 45 МБ.",
         "first": "Сначала выберите услугу."
     },
     "en": {
@@ -91,7 +90,7 @@ TEXTS = {
         "processing": "⏳ Processing video...",
         "done": "✅ Video is ready!",
         "error": "❌ Video processing failed.",
-        "subscribe": "📢 Subscribe to our channel to use the bot.",
+        "subscribe": "📢 Subscribe to our channel before using the bot.",
         "check": "✅ Check subscription",
         "not_sub": "❌ You haven't subscribed yet.",
         "language": "🌐 Choose your language:",
@@ -127,14 +126,18 @@ def subscription_keyboard(lang):
     t = TEXTS[lang]
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(
-                text="📢 Kanalga o'tish",
-                url=CHANNEL_URL
-            )],
-            [InlineKeyboardButton(
-                text=t["check"],
-                callback_data="check_sub"
-            )]
+            [
+                InlineKeyboardButton(
+                    text="📢 Kanalga obuna bo'lish",
+                    url=CHANNEL_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t["check"],
+                    callback_data="check_sub"
+                )
+            ]
         ]
     )
 
@@ -145,7 +148,9 @@ async def is_subscribed(user_id):
             chat_id=CHANNEL_ID,
             user_id=user_id
         )
-        return member.status in ("member", "administrator", "creator")
+        return member.status in (
+            "member", "administrator", "creator"
+        )
     except Exception:
         log.exception("SUBSCRIPTION CHECK ERROR")
         return False
@@ -162,9 +167,9 @@ async def show_menu(message, lang):
 @dp.message(CommandStart())
 async def start(message: Message):
     uid = message.from_user.id
+    lang = users.get(uid, "uz")
 
     if not await is_subscribed(uid):
-        lang = users.get(uid, "uz")
         await message.answer(
             TEXTS[lang]["subscribe"],
             reply_markup=subscription_keyboard(lang)
@@ -178,18 +183,19 @@ async def start(message: Message):
         )
         return
 
-    await show_menu(message, users[uid])
+    await show_menu(message, lang)
 
 
 @dp.callback_query(F.data.startswith("lang_"))
 async def language_choice(call: CallbackQuery):
     lang = call.data.replace("lang_", "")
+
     if lang not in TEXTS:
         await call.answer()
         return
 
     users[call.from_user.id] = lang
-    await call.answer("OK")
+    await call.answer()
 
     if not await is_subscribed(call.from_user.id):
         await call.message.answer(
@@ -214,6 +220,7 @@ async def check_subscription(call: CallbackQuery):
         return
 
     await call.answer("✅ Obuna tasdiqlandi!")
+
     if uid not in users:
         await call.message.answer(
             TEXTS[lang]["language"],
