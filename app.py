@@ -158,7 +158,7 @@ async def search_tracks(query: str) -> list[dict]:
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.get(SEARCH_URL, params=params) as response:
             response.raise_for_status()
-            data = await response.json()
+            data = await response.json(content_type=None)
             return data.get("results", [])
 
 
