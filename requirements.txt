@@ -1,5 +1,3 @@
-
-Flask
-pyTelegramBotAPI
-yt-dlp
-gunicorn
+aiogram==3.31.0
+aiohttp>=3.12.0,<4.0
+python-dotenv>=1.0.0,<2.0
