@@ -274,17 +274,31 @@ def valid_video_url(raw: str) -> bool:
         return False
 
 
-async def download_public_link(url: str, folder: Path) -> Path:
+def detect_platform(url: str) -> tuple[str, str]:
+    host = (urlparse(url).hostname or "").lower()
+    if "instagram.com" in host:
+        return "instagram", "Instagram"
+    if "tiktok.com" in host:
+        return "tiktok", "TikTok"
+    return "youtube", "YouTube"
+
+
+async def download_public_link(url: str, folder: Path, platform: str | None = None) -> Path:
     try:
         import yt_dlp
     except ImportError:
         raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
 
+    platform = platform or detect_platform(url)[0]
     output_template = str(folder / "link_video.%(ext)s")
+    # Har bir platformada manbadagi kadr nisbati va o‘lcham saqlanadi:
+    # YouTube 16:9 bo‘lsa 16:9, Instagram/TikTok vertikal bo‘lsa vertikal qoladi.
+    # Faqat MP4 konteyneriga joylanadi; video qayta kesilmaydi yoki o‘lchami almashtirilmaydi.
     options = {
         # Eng yaxshi sifatdagi video va audioni oladi; 1080p cheklovi yo‘q.
         # Kadr o‘lchami, tomonlar nisbati va sifat qayta o‘zgartirilmaydi.
         "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "quality", "fps"],
         "outtmpl": output_template,
         "noplaylist": True,
         "max_filesize": MAX_LINK_BYTES,
@@ -305,6 +319,7 @@ async def download_public_link(url: str, folder: Path) -> Path:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
 
+    log.info("Video yuklanmoqda: platforma=%s", platform)
     await asyncio.to_thread(do_download)
     files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
     if not files:
@@ -326,10 +341,14 @@ async def handle_text(message: Message):
             return
         status = await message.answer("⚡ Video tezkor rejimda yuklanmoqda... Odatda 1 daqiqada tayyor bo‘lishiga harakat qiladi.")
         try:
+            platform, platform_title = detect_platform(text)
             async with VIDEO_SEMAPHORE:
                 with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
-                    video_path = await download_public_link(text, Path(tmp))
-                    await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
+                    video_path = await download_public_link(text, Path(tmp), platform)
+                    await message.answer_video(
+                        FSInputFile(video_path),
+                        caption=f"✅ {platform_title} videosi MP4 formatda tayyor!"
+                    )
             await status.delete()
         except Exception:
             log.exception("Link download failed")
