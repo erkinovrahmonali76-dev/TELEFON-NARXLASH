@@ -269,7 +269,9 @@ async def download_public_link(url: str, folder: Path) -> Path:
 
     output_template = str(folder / "link_video.%(ext)s")
     options = {
-        "format": "best[ext=mp4][height<=1080]/best[height<=1080]/best",
+        # Eng yaxshi sifatdagi video va audioni oladi; 1080p cheklovi yo‘q.
+        # Kadr o‘lchami, tomonlar nisbati va sifat qayta o‘zgartirilmaydi.
+        "format": "bestvideo+bestaudio/best",
         "outtmpl": output_template,
         "noplaylist": True,
         "max_filesize": MAX_LINK_BYTES,
@@ -277,7 +279,9 @@ async def download_public_link(url: str, folder: Path) -> Path:
         "retries": 2,
         "quiet": True,
         "no_warnings": True,
+        # Video oqimini qayta kodlamasdan MP4 konteyneriga joylaydi.
         "merge_output_format": "mp4",
+        "remuxvideo": "mp4",
     }
 
     def do_download():
