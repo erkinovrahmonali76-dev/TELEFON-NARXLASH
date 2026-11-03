@@ -66,6 +66,9 @@ subscribe_keyboard = InlineKeyboardMarkup(
 
 # Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
 user_modes: dict[int, str] = {}
+subscription_cache: dict[int, float] = {}
+SUBSCRIPTION_CACHE_SECONDS = 30
+VIDEO_SEMAPHORE = asyncio.Semaphore(2)
 
 ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
@@ -89,14 +92,23 @@ def main_text() -> str:
     )
 
 
-async def is_subscribed(user_id: int) -> bool:
+async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
+    now = asyncio.get_running_loop().time()
+    cached_until = subscription_cache.get(user_id, 0)
+    if use_cache and cached_until > now:
+        return True
     try:
         member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in {
+        subscribed = member.status in {
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.CREATOR,
         }
+        if subscribed:
+            subscription_cache[user_id] = now + SUBSCRIPTION_CACHE_SECONDS
+        else:
+            subscription_cache.pop(user_id, None)
+        return subscribed
     except Exception:
         log.exception("Kanal obunasini tekshirishda xatolik")
         return False
@@ -136,7 +148,7 @@ async def check_subscription_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
-    if await is_subscribed(callback.from_user.id):
+    if await is_subscribed(callback.from_user.id, use_cache=False):
         await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
         if callback.message:
             await callback.message.answer(main_text(), reply_markup=keyboard)
@@ -207,8 +219,8 @@ async def make_round(src: Path, dst: Path):
     await run_ffmpeg([
         "-i", str(src),
         "-t", "60",
-        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27",
         "-c:a", "aac", "-b:a", "96k", "-ac", "2",
         "-movflags", "+faststart", str(dst)
     ])
@@ -217,31 +229,32 @@ async def make_round(src: Path, dst: Path):
 async def make_916(src: Path, dst: Path):
     await run_ffmpeg([
         "-i", str(src),
-        "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "26",
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(dst)
     ])
 
 
 async def process_uploaded_video(message: Message, mode: str):
-    status = await message.answer("⏳ Video tayyorlanmoqda...")
+    status = await message.answer("⚡ Video tezkor rejimda tayyorlanmoqda...")
     try:
-        with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
-            folder = Path(tmp)
-            src = folder / "input_video"
-            dst = folder / "output.mp4"
-            await download_telegram_video(message, src)
-            if mode == "round":
-                await make_round(src, dst)
-                if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
-                await message.answer_video_note(FSInputFile(dst))
-            else:
-                await make_916(src, dst)
-                if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
-                await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
+        async with VIDEO_SEMAPHORE:
+            with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
+                folder = Path(tmp)
+                src = folder / "input_video"
+                dst = folder / "output.mp4"
+                await download_telegram_video(message, src)
+                if mode == "round":
+                    await make_round(src, dst)
+                    if dst.stat().st_size > MAX_OUTPUT_BYTES:
+                        raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
+                    await message.answer_video_note(FSInputFile(dst))
+                else:
+                    await make_916(src, dst)
+                    if dst.stat().st_size > MAX_OUTPUT_BYTES:
+                        raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
+                    await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
         await status.delete()
     except Exception as exc:
         log.exception("Video processing failed")
@@ -275,8 +288,12 @@ async def download_public_link(url: str, folder: Path) -> Path:
         "outtmpl": output_template,
         "noplaylist": True,
         "max_filesize": MAX_LINK_BYTES,
-        "socket_timeout": 25,
-        "retries": 2,
+        "socket_timeout": 15,
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
+        "concurrent_fragment_downloads": 4,
+        "buffersize": 1024 * 1024,
         "quiet": True,
         "no_warnings": True,
         # Video oqimini qayta kodlamasdan MP4 konteyneriga joylaydi.
@@ -307,11 +324,12 @@ async def handle_text(message: Message):
         if not valid_video_url(text):
             await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
             return
-        status = await message.answer("⏳ Havola tekshirilmoqda va video olinmoqda...")
+        status = await message.answer("⚡ Video tezkor rejimda yuklanmoqda... Odatda 1 daqiqada tayyor bo‘lishiga harakat qiladi.")
         try:
-            with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
-                video_path = await download_public_link(text, Path(tmp))
-                await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
+            async with VIDEO_SEMAPHORE:
+                with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
+                    video_path = await download_public_link(text, Path(tmp))
+                    await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
             await status.delete()
         except Exception:
             log.exception("Link download failed")
