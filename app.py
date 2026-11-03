@@ -1,22 +1,30 @@
+
 import asyncio
 import logging
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
-    Video, Document, ReplyKeyboardRemove, FSInputFile
+    Message,
+    CallbackQuery,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    FSInputFile
 )
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler,
+    setup_application
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("asaved")
@@ -27,14 +35,26 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
-if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
-    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin; faqat harf, raqam, _ yoki - ishlating")
-if not BASE_URL:
-    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring")
+# MAJBURIY OBUNA KANALI
+CHANNEL_ID = "@ReklamaBozoriUzz"
+CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN kiritilmagan")
+
+if not WEBHOOK_SECRET or not re.fullmatch(
+    r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET
+):
+    raise RuntimeError("WEBHOOK_SECRET noto'g'ri")
+
+if not BASE_URL:
+    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi")
+
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
@@ -45,26 +65,193 @@ BTN_916 = "📱 9:16 format"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
-        [KeyboardButton(text=BTN_LINK)],
+        [
+            KeyboardButton(text=BTN_ROUND),
+            KeyboardButton(text=BTN_916)
+        ],
+        [KeyboardButton(text=BTN_LINK)]
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
 )
 
-# Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
 user_modes: dict[int, str] = {}
 
 ALLOWED_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-    "instagram.com", "www.instagram.com",
-    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+    "instagram.com",
+    "www.instagram.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "vm.tiktok.com",
+    "vt.tiktok.com",
 }
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # Telegram cloud Bot API getFile cheklovi
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
+
+
+# =========================
+# OBUNANI TEKSHIRISH
+# =========================
+
+def subscription_keyboard():
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📢 Kanalga obuna bo'lish",
+                    url=CHANNEL_URL
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✅ Obunani tekshirish",
+                    callback_data="check_subscription"
+                )
+            ]
+        ]
+    )
+
+
+async def is_subscribed(user_id: int) -> bool:
+    member = await bot.get_chat_member(
+        chat_id=CHANNEL_ID,
+        user_id=user_id
+    )
+
+    if member.status in (
+        ChatMemberStatus.MEMBER,
+        ChatMemberStatus.ADMINISTRATOR,
+        ChatMemberStatus.CREATOR
+    ):
+        return True
+
+    if (
+        member.status == ChatMemberStatus.RESTRICTED
+        and member.is_member
+    ):
+        return True
+
+    return False
+
+
+async def ask_subscription(message: Message):
+    await message.answer(
+        "🔒 <b>ASAVED botidan foydalanish uchun</b>\n\n"
+        "Avval quyidagi kanalga obuna bo'ling:\n\n"
+        "📢 @ReklamaBozoriUzz\n\n"
+        "Obuna bo'lgach, tekshirish tugmasini bosing.",
+        reply_markup=subscription_keyboard()
+    )
+
+
+# =========================
+# MIDDLEWARE
+# =========================
+
+class SubscriptionMiddleware(BaseMiddleware):
+
+    async def __call__(self, handler, event, data):
+
+        user = getattr(event, "from_user", None)
+
+        if not user:
+            return await handler(event, data)
+
+        # Obunani tekshirish callbackiga ruxsat
+        if (
+            isinstance(event, CallbackQuery)
+            and event.data == "check_subscription"
+        ):
+            return await handler(event, data)
+
+        try:
+            subscribed = await is_subscribed(user.id)
+
+        except Exception:
+            log.exception("Subscription check failed")
+
+            if isinstance(event, Message):
+                await event.answer(
+                    "⚠️ Obunani tekshirishda xatolik.\n"
+                    "Birozdan keyin urinib ko'ring."
+                )
+            elif isinstance(event, CallbackQuery):
+                await event.answer(
+                    "Tekshirishda xatolik.",
+                    show_alert=True
+                )
+
+            return
+
+        if not subscribed:
+
+            if isinstance(event, Message):
+                await ask_subscription(event)
+
+            elif isinstance(event, CallbackQuery):
+                await event.answer(
+                    "Avval kanalga obuna bo'ling!",
+                    show_alert=True
+                )
+
+            return
+
+        return await handler(event, data)
+
+
+router.message.middleware(SubscriptionMiddleware())
+router.callback_query.middleware(SubscriptionMiddleware())
+
+
+# =========================
+# OBUNA TUGMASI
+# =========================
+
+@router.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery):
+
+    try:
+        subscribed = await is_subscribed(callback.from_user.id)
+
+        if subscribed:
+            await callback.answer(
+                "✅ Obuna tasdiqlandi!"
+            )
+
+            user_modes.pop(callback.from_user.id, None)
+
+            await callback.message.delete()
+
+            await callback.message.answer(
+                main_text(),
+                reply_markup=keyboard
+            )
+
+        else:
+            await callback.answer(
+                "❌ Siz hali kanalga obuna bo'lmagansiz!",
+                show_alert=True
+            )
+
+    except Exception:
+        log.exception("Subscription callback failed")
+
+        await callback.answer(
+            "⚠️ Tekshirishda xatolik.",
+            show_alert=True
+        )
+
+
+# =========================
+# ASOSIY MATN
+# =========================
 
 def main_text() -> str:
     return (
@@ -72,120 +259,288 @@ def main_text() -> str:
         "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
         "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
         "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n\n"
-        "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
+        "Faqat o'zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
+
+
+# =========================
+# START
+# =========================
 
 @router.message(CommandStart())
 async def start(message: Message):
+
     user_modes.pop(message.from_user.id, None)
-    await message.answer(main_text(), reply_markup=keyboard)
+
+    await message.answer(
+        main_text(),
+        reply_markup=keyboard
+    )
+
+
+# =========================
+# MENYU
+# =========================
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
+
     user_modes[message.from_user.id] = "round"
-    await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
+
+    await message.answer(
+        "🎥 Endi galereyadan 60 soniyagacha video yuboring."
+    )
+
 
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
+
     user_modes[message.from_user.id] = "916"
-    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
+
+    await message.answer(
+        "📱 Endi 9:16 formatga o'tkazish uchun videoni yuboring."
+    )
+
 
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
+
     user_modes[message.from_user.id] = "link"
-    await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
+    await message.answer(
+        "🔗 YouTube, Instagram yoki TikTok video havolasini yuboring."
+    )
+
+
+# =========================
+# VIDEO MA'LUMOTI
+# =========================
 
 def get_video_info(message: Message):
+
     if message.video:
-        return message.video.file_id, message.video.file_size, message.video.duration, "video.mp4"
-    if message.document and (message.document.mime_type or "").startswith("video/"):
-        return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
+        return (
+            message.video.file_id,
+            message.video.file_size,
+            message.video.duration,
+            "video.mp4"
+        )
+
+    if (
+        message.document
+        and (message.document.mime_type or "").startswith("video/")
+    ):
+        return (
+            message.document.file_id,
+            message.document.file_size,
+            None,
+            message.document.file_name or "video.mp4"
+        )
+
     return None
 
-async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
+
+async def download_telegram_video(
+    message: Message,
+    target: Path
+):
+
     info = get_video_info(message)
+
     if not info:
-        raise ValueError("Video topilmadi. Iltimos, video fayl yuboring.")
+        raise ValueError("Video topilmadi.")
+
     file_id, size, duration, filename = info
+
     if size and size > MAX_UPLOAD_BYTES:
-        raise ValueError("Video 20 MB dan katta. Telegram bot orqali bunday faylni olish imkoni yo‘q; kichikroq video yuboring.")
+        raise ValueError("Video 20 MB dan katta.")
+
     if duration and duration > MAX_SECONDS:
-        raise ValueError("Video 10 daqiqadan uzun. Qisqaroq video yuboring.")
+        raise ValueError("Video 10 daqiqadan uzun.")
+
     tg_file = await bot.get_file(file_id)
-    await bot.download_file(tg_file.file_path, destination=target)
+
+    await bot.download_file(
+        tg_file.file_path,
+        destination=target
+    )
+
     return target, duration
 
+
+# =========================
+# FFMPEG
+# =========================
+
 async def run_ffmpeg(args: list[str]):
+
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
+
     _, stderr = await proc.communicate()
+
     if proc.returncode != 0:
-        raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
+        raise RuntimeError(
+            stderr.decode("utf-8", "ignore")[-1200:]
+            or "FFmpeg xatoligi"
+        )
+
 
 async def make_round(src: Path, dst: Path):
-    # Telegram video note kvadrat bo‘lishi va 60 soniyadan oshmasligi kerak.
+
     await run_ffmpeg([
         "-i", str(src),
         "-t", "60",
-        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
-        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
-        "-movflags", "+faststart", str(dst)
+        "-vf",
+        "scale=640:640:force_original_aspect_ratio=increase,"
+        "crop=640:640,setsar=1",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "27",
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-ac", "2",
+        "-movflags", "+faststart",
+        str(dst)
     ])
+
 
 async def make_916(src: Path, dst: Path):
-    # 9:16 portret: kadr markazidan crop qilinadi, qora chetlar qo‘shilmaydi.
+
     await run_ffmpeg([
         "-i", str(src),
-        "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
-        "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", str(dst)
+        "-vf",
+        "scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280,setsar=1",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "26",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        str(dst)
     ])
 
-async def process_uploaded_video(message: Message, mode: str):
-    status = await message.answer("⏳ Video tayyorlanmoqda...")
+
+# =========================
+# VIDEO QAYTA ISHLASH
+# =========================
+
+async def process_uploaded_video(
+    message: Message,
+    mode: str
+):
+
+    status = await message.answer(
+        "⏳ Video tayyorlanmoqda..."
+    )
+
     try:
-        with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
+
+        with tempfile.TemporaryDirectory(
+            prefix="asaved_"
+        ) as tmp:
+
             folder = Path(tmp)
             src = folder / "input_video"
             dst = folder / "output.mp4"
-            await download_telegram_video(message, src)
+
+            await download_telegram_video(
+                message,
+                src
+            )
+
             if mode == "round":
+
                 await make_round(src, dst)
+
                 if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
-                await message.answer_video_note(FSInputFile(dst))
+                    raise ValueError(
+                        "Tayyor video juda katta."
+                    )
+
+                await message.answer_video_note(
+                    FSInputFile(dst)
+                )
+
             else:
+
                 await make_916(src, dst)
+
                 if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
-                await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
+                    raise ValueError(
+                        "Tayyor video 49 MB dan katta."
+                    )
+
+                await message.answer_video(
+                    FSInputFile(dst),
+                    caption="📱 9:16 format tayyor!"
+                )
+
         await status.delete()
+
     except Exception as exc:
+
         log.exception("Video processing failed")
-        await status.edit_text(f"❌ Xatolik: {str(exc)[:700]}")
+
+        await status.edit_text(
+            f"❌ Xatolik: {str(exc)[:700]}"
+        )
+
     finally:
         user_modes.pop(message.from_user.id, None)
 
+
+# =========================
+# HAVOLA TEKSHIRISH
+# =========================
+
 def valid_video_url(raw: str) -> bool:
+
     try:
         parsed = urlparse(raw.strip())
         host = (parsed.hostname or "").lower()
-        return parsed.scheme == "https" and (host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS))
+
+        return (
+            parsed.scheme == "https"
+            and (
+                host in ALLOWED_HOSTS
+                or any(
+                    host.endswith("." + h)
+                    for h in ALLOWED_HOSTS
+                )
+            )
+        )
+
     except Exception:
         return False
 
-async def download_public_link(url: str, folder: Path) -> Path:
-    # yt-dlp public, ruxsat etilgan kontent uchungina ishlatiladi.
+
+async def download_public_link(
+    url: str,
+    folder: Path
+) -> Path:
+
     try:
         import yt_dlp
-    except ImportError:
-        raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
 
-    output_template = str(folder / "link_video.%(ext)s")
+    except ImportError:
+        raise RuntimeError(
+            "yt-dlp o'rnatilmagan."
+        )
+
+    output_template = str(
+        folder / "link_video.%(ext)s"
+    )
+
     options = {
         "format": "best[ext=mp4][height<=1080]/best[height<=1080]/best",
         "outtmpl": output_template,
@@ -197,101 +552,249 @@ async def download_public_link(url: str, folder: Path) -> Path:
         "no_warnings": True,
         "merge_output_format": "mp4",
     }
+
     def do_download():
+
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
+
     await asyncio.to_thread(do_download)
-    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
+
+    files = [
+        p for p in folder.iterdir()
+        if p.is_file()
+        and p.name.startswith("link_video.")
+    ]
+
     if not files:
-        raise RuntimeError("Video topilmadi yoki platforma yuklashga ruxsat bermadi.")
-    result = max(files, key=lambda p: p.stat().st_size)
+        raise RuntimeError(
+            "Video topilmadi yoki platforma yuklashga ruxsat bermadi."
+        )
+
+    result = max(
+        files,
+        key=lambda p: p.stat().st_size
+    )
+
     if result.stat().st_size > MAX_LINK_BYTES:
-        raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
+        raise RuntimeError(
+            "Video 49 MB dan katta."
+        )
+
     return result
+
+
+# =========================
+# MATN VA HAVOLALAR
+# =========================
 
 @router.message(F.text)
 async def handle_text(message: Message):
+
     text = (message.text or "").strip()
     mode = user_modes.get(message.from_user.id)
 
     if mode == "link":
+
         if not valid_video_url(text):
-            await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
-            return
-        status = await message.answer("⏳ Havola tekshirilmoqda va video olinmoqda...")
-        try:
-            with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
-                video_path = await download_public_link(text, Path(tmp))
-                await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
-            await status.delete()
-        except Exception as exc:
-            log.exception("Link download failed")
-            await status.edit_text(
-                "❌ Videoni olib bo‘lmadi.\n"
-                "Sabab: havola yopiq bo‘lishi, platforma cheklovi yoki video hajmi bo‘lishi mumkin.\n"
-                "O‘zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko‘ring."
+
+            await message.answer(
+                "❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring."
             )
+
+            return
+
+        status = await message.answer(
+            "⏳ Havola tekshirilmoqda va video olinmoqda..."
+        )
+
+        try:
+
+            with tempfile.TemporaryDirectory(
+                prefix="asaved_link_"
+            ) as tmp:
+
+                video_path = await download_public_link(
+                    text,
+                    Path(tmp)
+                )
+
+                await message.answer_video(
+                    FSInputFile(video_path),
+                    caption="✅ Video tayyor!"
+                )
+
+            await status.delete()
+
+        except Exception:
+
+            log.exception("Link download failed")
+
+            await status.edit_text(
+                "❌ Videoni olib bo'lmadi.\n"
+                "Sabab: havola yopiq bo'lishi, platforma cheklovi yoki video hajmi bo'lishi mumkin.\n"
+                "Faqat yuklashga ruxsatingiz bor videolardan foydalaning."
+            )
+
         finally:
             user_modes.pop(message.from_user.id, None)
+
         return
 
     if mode in ("round", "916"):
-        await message.answer("Iltimos, havola emas, galereyadan video fayl yuboring.")
+
+        await message.answer(
+            "Iltimos, havola emas, galereyadan video fayl yuboring."
+        )
+
         return
 
     if valid_video_url(text):
-        await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
+
+        await message.answer(
+            "Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring."
+        )
+
     else:
-        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+
+        await message.answer(
+            "Menyudan kerakli funksiyani tanlang.",
+            reply_markup=keyboard
+        )
+
+
+# =========================
+# VIDEO QABUL QILISH
+# =========================
 
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
+
     mode = user_modes.get(message.from_user.id)
+
     if mode not in ("round", "916"):
-        await message.answer("Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang.")
+
+        await message.answer(
+            "Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang."
+        )
+
         return
+
     if not get_video_info(message):
-        await message.answer("Iltimos, video fayl yuboring.")
+
+        await message.answer(
+            "Iltimos, video fayl yuboring."
+        )
+
         return
-    await process_uploaded_video(message, mode)
+
+    await process_uploaded_video(
+        message,
+        mode
+    )
+
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+
+    await message.answer(
+        "Menyudan kerakli funksiyani tanlang.",
+        reply_markup=keyboard
+    )
+
+
+# =========================
+# WEBHOOK
+# =========================
 
 async def on_startup():
-    webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
+
+    webhook_url = (
+        f"{BASE_URL}/{WEBHOOK_PATH}"
+    )
+
     await bot.set_webhook(
         webhook_url,
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
         allowed_updates=dp.resolve_used_update_types()
     )
-    log.info("Webhook set: %s", webhook_url)
+
+    log.info(
+        "Webhook set: %s",
+        webhook_url
+    )
+
 
 async def on_shutdown():
-    await bot.delete_webhook(drop_pending_updates=False)
+
+    await bot.delete_webhook(
+        drop_pending_updates=False
+    )
+
     await bot.session.close()
 
+
 async def main():
-    app = web.Application(client_max_size=2 * 1024 * 1024)
-    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
-    app.router.add_get("/health", lambda request: web.Response(text="ok"))
+
+    app = web.Application(
+        client_max_size=2 * 1024 * 1024
+    )
+
+    app.router.add_get(
+        "/",
+        lambda request: web.Response(
+            text="ASAVED bot is running"
+        )
+    )
+
+    app.router.add_get(
+        "/health",
+        lambda request: web.Response(text="ok")
+    )
+
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
         secret_token=WEBHOOK_SECRET
-    ).register(app, path=f"/{WEBHOOK_PATH}")
-    setup_application(app, dp, bot=bot)
-    app.on_startup.append(lambda app: on_startup())
-    app.on_cleanup.append(lambda app: on_shutdown())
+    ).register(
+        app,
+        path=f"/{WEBHOOK_PATH}"
+    )
+
+    setup_application(
+        app,
+        dp,
+        bot=bot
+    )
+
+    app.on_startup.append(
+        lambda app: on_startup()
+    )
+
+    app.on_cleanup.append(
+        lambda app: on_shutdown()
+    )
+
     runner = web.AppRunner(app)
+
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+
+    site = web.TCPSite(
+        runner,
+        "0.0.0.0",
+        PORT
+    )
+
     await site.start()
-    log.info("ASAVED listening on port %s", PORT)
-    # Render Web Service processini faol ushlab turish.
+
+    log.info(
+        "ASAVED listening on port %s",
+        PORT
+    )
+
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
