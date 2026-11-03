@@ -1,18 +1,11 @@
 import asyncio
-import base64
-import hashlib
-import hmac
-import html
-import json
 import logging
 import os
 import re
-import secrets
-import time
+import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
-from io import BytesIO
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -20,7 +13,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    Video, Document, ReplyKeyboardRemove, FSInputFile
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
@@ -48,26 +42,18 @@ dp.include_router(router)
 BTN_ROUND = "🎥 Dumaloq video"
 BTN_LINK = "🔗 Video havolasi"
 BTN_916 = "📱 9:16 format"
-BTN_PRANK = "😂 Do‘stga Prank"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
         [KeyboardButton(text=BTN_LINK)],
-        [KeyboardButton(text=BTN_PRANK)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
 )
 
-# Foydalanuvchining keyingi amali.
+# Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
 user_modes: dict[int, str] = {}
-prank_names: dict[int, str] = {}
-
-# Prank havolasi ichida imzolangan ma'lumot saqlanadi.
-# Shu sababli Render qayta ishga tushganda ham havola yo'qolmaydi.
-PRANK_TTL_SECONDS = 24 * 60 * 60
-MAX_PRANK_IMAGE_BYTES = 5 * 1024 * 1024
 
 ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
@@ -75,106 +61,39 @@ ALLOWED_HOSTS = {
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
 }
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # Telegram cloud Bot API getFile cheklovi
 MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
-
-def create_prank_token(name: str, telegram_file_id: str) -> str:
-    """Rasm file_id va ismni 24 soatlik imzolangan havola tokeniga joylaydi."""
-    payload = {
-        "name": name,
-        "file_id": telegram_file_id,
-        "expires": int(time.time()) + PRANK_TTL_SECONDS,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    signature = hmac.new(
-        WEBHOOK_SECRET.encode("utf-8"),
-        encoded.encode("ascii"),
-        hashlib.sha256
-    ).hexdigest()
-    return f"{encoded}.{signature}"
-
-
-def read_prank_token(token: str):
-    """Token imzosini va amal qilish muddatini tekshiradi."""
-    try:
-        encoded, signature = token.rsplit(".", 1)
-        expected = hmac.new(
-            WEBHOOK_SECRET.encode("utf-8"),
-            encoded.encode("ascii"),
-            hashlib.sha256
-        ).hexdigest()
-        if not hmac.compare_digest(signature, expected):
-            return None
-
-        padded = encoded + "=" * (-len(encoded) % 4)
-        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
-        payload = json.loads(raw.decode("utf-8"))
-
-        if int(payload.get("expires", 0)) < int(time.time()):
-            return None
-        if not isinstance(payload.get("name"), str):
-            return None
-        if not isinstance(payload.get("file_id"), str):
-            return None
-        if not payload["file_id"]:
-            return None
-        return payload
-    except (ValueError, TypeError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
-        return None
-
-
 def main_text() -> str:
     return (
-        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\\n\\n"
-        "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\\n"
-        "📱 <b>9:16 format</b> — galereyadan video yuboring.\\n"
-        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\\n"
-        "😂 <b>Do‘stga Prank</b> — do‘stingiz uchun kulgili prank havolasi yarating.\\n\\n"
-        "Faqat o‘zingizga tegishli yoki foydalanishga ruxsatingiz bor media fayllardan foydalaning."
+        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
+        "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
+        "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
+        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n\n"
+        "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
-
 
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
-    prank_names.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
-
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
     user_modes[message.from_user.id] = "round"
     await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
 
-
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
     user_modes[message.from_user.id] = "916"
-    await message.answer("📱 9:16 formatga o‘tkazish uchun videoni yuboring.")
-
+    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
     user_modes[message.from_user.id] = "link"
     await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
-
-
-@router.message(F.text == BTN_PRANK)
-async def choose_prank(message: Message):
-    user_modes[message.from_user.id] = "prank_name"
-    prank_names.pop(message.from_user.id, None)
-    await message.answer(
-        "😂 <b>DO‘STGA PRANK</b>\\n\\n"
-        "1️⃣ Do‘stingizning ismini yozing.\\n"
-        "Keyin uning rasmini yuborasiz.\\n\\n"
-        "Eslatma: faqat ulashishga ruxsatingiz bor rasmni yuboring. "
-        "Prank sahifasining oxirida bu hazil ekani ochiq ko‘rsatiladi."
-    )
-
 
 def get_video_info(message: Message):
     if message.video:
@@ -182,7 +101,6 @@ def get_video_info(message: Message):
     if message.document and (message.document.mime_type or "").startswith("video/"):
         return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
     return None
-
 
 async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
     info = get_video_info(message)
@@ -197,7 +115,6 @@ async def download_telegram_video(message: Message, target: Path) -> tuple[Path,
     await bot.download_file(tg_file.file_path, destination=target)
     return target, duration
 
-
 async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
@@ -207,8 +124,8 @@ async def run_ffmpeg(args: list[str]):
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
 
-
 async def make_round(src: Path, dst: Path):
+    # Telegram video note kvadrat bo‘lishi va 60 soniyadan oshmasligi kerak.
     await run_ffmpeg([
         "-i", str(src),
         "-t", "60",
@@ -218,8 +135,8 @@ async def make_round(src: Path, dst: Path):
         "-movflags", "+faststart", str(dst)
     ])
 
-
 async def make_916(src: Path, dst: Path):
+    # 9:16 portret: kadr markazidan crop qilinadi, qora chetlar qo‘shilmaydi.
     await run_ffmpeg([
         "-i", str(src),
         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
@@ -227,7 +144,6 @@ async def make_916(src: Path, dst: Path):
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(dst)
     ])
-
 
 async def process_uploaded_video(message: Message, mode: str):
     status = await message.answer("⏳ Video tayyorlanmoqda...")
@@ -254,19 +170,16 @@ async def process_uploaded_video(message: Message, mode: str):
     finally:
         user_modes.pop(message.from_user.id, None)
 
-
 def valid_video_url(raw: str) -> bool:
     try:
         parsed = urlparse(raw.strip())
         host = (parsed.hostname or "").lower()
-        return parsed.scheme == "https" and (
-            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
-        )
+        return parsed.scheme == "https" and (host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS))
     except Exception:
         return False
 
-
 async def download_public_link(url: str, folder: Path) -> Path:
+    # yt-dlp public, ruxsat etilgan kontent uchungina ishlatiladi.
     try:
         import yt_dlp
     except ImportError:
@@ -284,11 +197,9 @@ async def download_public_link(url: str, folder: Path) -> Path:
         "no_warnings": True,
         "merge_output_format": "mp4",
     }
-
     def do_download():
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
-
     await asyncio.to_thread(do_download)
     files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
     if not files:
@@ -298,28 +209,10 @@ async def download_public_link(url: str, folder: Path) -> Path:
         raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
     return result
 
-
 @router.message(F.text)
 async def handle_text(message: Message):
     text = (message.text or "").strip()
-    user_id = message.from_user.id
-    mode = user_modes.get(user_id)
-
-    if mode == "prank_name":
-        if not 2 <= len(text) <= 40:
-            await message.answer("Ism 2 tadan 40 tagacha belgidan iborat bo‘lsin. Qayta yozing.")
-            return
-        prank_names[user_id] = text
-        user_modes[user_id] = "prank_photo"
-        await message.answer(
-            f"✅ Ism qabul qilindi: <b>{html.escape(text)}</b>\\n\\n"
-            "Endi do‘stingizning rasmini <b>foto</b> ko‘rinishida yuboring."
-        )
-        return
-
-    if mode == "prank_photo":
-        await message.answer("📸 Iltimos, rasmni Telegram'ga foto qilib yuboring.")
-        return
+    mode = user_modes.get(message.from_user.id)
 
     if mode == "link":
         if not valid_video_url(text):
@@ -331,14 +224,15 @@ async def handle_text(message: Message):
                 video_path = await download_public_link(text, Path(tmp))
                 await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
             await status.delete()
-        except Exception:
+        except Exception as exc:
             log.exception("Link download failed")
             await status.edit_text(
-                "❌ Videoni olib bo‘lmadi. Havola yopiq, platforma cheklovi yoki video hajmi sabab bo‘lishi mumkin. "
+                "❌ Videoni olib bo‘lmadi.\n"
+                "Sabab: havola yopiq bo‘lishi, platforma cheklovi yoki video hajmi bo‘lishi mumkin.\n"
                 "O‘zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko‘ring."
             )
         finally:
-            user_modes.pop(user_id, None)
+            user_modes.pop(message.from_user.id, None)
         return
 
     if mode in ("round", "916"):
@@ -349,42 +243,6 @@ async def handle_text(message: Message):
         await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
     else:
         await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
-
-
-@router.message(F.photo)
-async def handle_prank_photo(message: Message):
-    user_id = message.from_user.id
-    if user_modes.get(user_id) != "prank_photo":
-        await message.answer("Rasm bilan ishlash uchun avval menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
-        return
-
-    photo = message.photo[-1]
-    if photo.file_size and photo.file_size > MAX_PRANK_IMAGE_BYTES:
-        await message.answer("❌ Rasm 5 MB dan katta. Iltimos, kichikroq rasm yuboring.")
-        return
-
-    status = await message.answer("⏳ Prank sahifasi tayyorlanmoqda...")
-    try:
-        # Rasmni server RAM'iga ko'chirmaymiz: Telegram file_id orqali keyin olinadi.
-        token = create_prank_token(
-            prank_names.get(user_id, "Do‘st"),
-            photo.file_id
-        )
-        link = f"{BASE_URL}/prank/{token}"
-        user_modes.pop(user_id, None)
-        prank_names.pop(user_id, None)
-
-        await status.edit_text(
-            "🎉 <b>Prank tayyor!</b>\\n\\n"
-            f"Do‘stingizga yuborish uchun havola:\\n{link}\\n\\n"
-            "⏳ Havola 24 soatgacha ishlaydi. Sahifadagi oxirgi qadamda hazil ekani ochiq aytiladi."
-        )
-    except Exception as exc:
-        log.exception("Prank creation failed")
-        await status.edit_text(f"❌ Prank yaratilmadi: {html.escape(str(exc)[:300])}")
-        user_modes.pop(user_id, None)
-        prank_names.pop(user_id, None)
-
 
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
@@ -397,98 +255,11 @@ async def handle_video(message: Message):
         return
     await process_uploaded_video(message, mode)
 
-
 @router.message()
 async def fallback(message: Message):
     await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
-
-async def prank_page(request: web.Request):
-    token = request.match_info["token"]
-    data = read_prank_token(token)
-    if not data:
-        return web.Response(
-            text="<h2>Bu prank havolasi muddati tugagan yoki noto‘g‘ri.</h2>",
-            content_type="text/html",
-            status=404,
-        )
-
-    # Ism HTML ichiga xavfsiz joylanadi.
-    safe_name = html.escape(data["name"], quote=True)
-    image_url = f"/prank/{token}/image"
-    page = f"""<!doctype html>
-<html lang="uz">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ASAVED Prank</title>
-<style>
-*{{box-sizing:border-box}} body{{margin:0;min-height:100vh;background:#10131c;color:#fff;
-font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:20px}}
-.card{{width:100%;max-width:440px;background:#1b2030;border:1px solid #343b50;border-radius:22px;
-padding:24px;text-align:center;box-shadow:0 18px 55px #0008}}
-.tag{{color:#aab5d1;font-size:12px;letter-spacing:2px}} h1{{font-size:26px;margin:14px 0}}
-p{{color:#d5d9e5;line-height:1.5}} img{{width:100%;max-height:360px;object-fit:contain;border-radius:14px;
-background:#0c0f17;margin:12px 0}} button{{width:100%;border:0;border-radius:13px;padding:15px;
-font-size:16px;font-weight:bold;background:#6d7cff;color:white;cursor:pointer;margin-top:12px}}
-.small{{font-size:12px;color:#9da6bb;margin-top:16px}}
-</style></head>
-<body><main class="card">
-<div class="tag">ASAVED • DO‘STGA PRANK</div>
-<section id="step">
-<h1>{safe_name}, sizga noodatiy xabar bor! 😳</h1>
-<p>Bu rasm siznikimi?</p>
-<img src="{image_url}" alt="Yuborilgan rasm">
-<button onclick="nextStep()">Keyingisini ko‘rish</button>
-</section>
-<p class="small">Bu sahifa hazil uchun tayyorlangan. Hech qanday ma’lumot yig‘ilmaydi.</p>
-</main>
-<script>
-const screens = [
-  ["Bir daqiqa... 👀", "Siz maxsus ASAVED prank sinoviga tushdingiz."],
-  ["Oxirgi tekshiruv! 😮", "Kulishga tayyormisiz? Keyingi tugmani bosing."],
-  ["HAZIL EDI! 😂", "Do‘stingiz sizga prank tayyorladi! 🤣"]
-];
-let index = 0;
-function nextStep() {{
-  const section = document.getElementById("step");
-  if (index < screens.length) {{
-    const item = screens[index++];
-    section.innerHTML = "<h1>" + item[0] + "</h1><p>" + item[1] + "</p>" +
-      (index === screens.length ? "<div style='font-size:54px'>🤣😂🤣</div>" : "") +
-      "<button onclick='nextStep()'>" + (index === screens.length ? "Yakunlash" : "Keyingisini ko‘rish") + "</button>";
-  }} else {{
-    section.innerHTML = "<h1>Prank tugadi! 😂</h1><p>ASAVED orqali tayyorlangan hazil.</p>";
-  }}
-}}
-</script></body></html>"""
-    return web.Response(text=page, content_type="text/html")
-
-
-async def prank_image(request: web.Request):
-    token = request.match_info["token"]
-    data = read_prank_token(token)
-    if not data:
-        raise web.HTTPNotFound(text="Prank havolasi muddati tugagan yoki noto‘g‘ri.")
-
-    try:
-        telegram_file = await bot.get_file(data["file_id"])
-        buffer = BytesIO()
-        await bot.download_file(telegram_file.file_path, destination=buffer)
-        image_bytes = buffer.getvalue()
-        if not image_bytes:
-            raise RuntimeError("Telegram'dan rasm olinmadi")
-        return web.Response(
-            body=image_bytes,
-            content_type="image/jpeg",
-            headers={"Cache-Control": "private, max-age=300"}
-        )
-    except Exception:
-        log.exception("Prank image loading failed")
-        raise web.HTTPBadGateway(text="Rasmni yuklab bo‘lmadi. Keyinroq qayta urinib ko‘ring.")
-
-
-async def on_startup(app):
+async def on_startup():
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
@@ -498,35 +269,29 @@ async def on_startup(app):
     )
     log.info("Webhook set: %s", webhook_url)
 
-
-async def on_shutdown(app):
+async def on_shutdown():
     await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
-
 
 async def main():
     app = web.Application(client_max_size=2 * 1024 * 1024)
     app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
     app.router.add_get("/health", lambda request: web.Response(text="ok"))
-    app.router.add_get("/prank/{token}", prank_page)
-    app.router.add_get("/prank/{token}/image", prank_image)
-
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
         secret_token=WEBHOOK_SECRET
     ).register(app, path=f"/{WEBHOOK_PATH}")
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_shutdown)
-
+    app.on_startup.append(lambda app: on_startup())
+    app.on_cleanup.append(lambda app: on_shutdown())
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("ASAVED listening on port %s", PORT)
+    # Render Web Service processini faol ushlab turish.
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
