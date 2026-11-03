@@ -1,6 +1,9 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import html
+import json
 import logging
 import os
 import re
@@ -9,6 +12,7 @@ import time
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
+from io import BytesIO
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -60,11 +64,10 @@ keyboard = ReplyKeyboardMarkup(
 user_modes: dict[int, str] = {}
 prank_names: dict[int, str] = {}
 
-# Prank sahifalari RAM'da saqlanadi. Render qayta ishga tushsa, havolalar yangidan yaratiladi.
-# Har bir sahifa 24 soatgacha ishlaydi.
+# Prank havolasi ichida imzolangan ma'lumot saqlanadi.
+# Shu sababli Render qayta ishga tushganda ham havola yo'qolmaydi.
 PRANK_TTL_SECONDS = 24 * 60 * 60
 MAX_PRANK_IMAGE_BYTES = 5 * 1024 * 1024
-prank_pages: dict[str, dict] = {}
 
 ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
@@ -78,6 +81,52 @@ MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
 
+def create_prank_token(name: str, telegram_file_id: str) -> str:
+    """Rasm file_id va ismni 24 soatlik imzolangan havola tokeniga joylaydi."""
+    payload = {
+        "name": name,
+        "file_id": telegram_file_id,
+        "expires": int(time.time()) + PRANK_TTL_SECONDS,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        encoded.encode("ascii"),
+        hashlib.sha256
+    ).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def read_prank_token(token: str):
+    """Token imzosini va amal qilish muddatini tekshiradi."""
+    try:
+        encoded, signature = token.rsplit(".", 1)
+        expected = hmac.new(
+            WEBHOOK_SECRET.encode("utf-8"),
+            encoded.encode("ascii"),
+            hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+
+        padded = encoded + "=" * (-len(encoded) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+
+        if int(payload.get("expires", 0)) < int(time.time()):
+            return None
+        if not isinstance(payload.get("name"), str):
+            return None
+        if not isinstance(payload.get("file_id"), str):
+            return None
+        if not payload["file_id"]:
+            return None
+        return payload
+    except (ValueError, TypeError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
 def main_text() -> str:
     return (
         "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\\n\\n"
@@ -87,16 +136,6 @@ def main_text() -> str:
         "😂 <b>Do‘stga Prank</b> — do‘stingiz uchun kulgili prank havolasi yarating.\\n\\n"
         "Faqat o‘zingizga tegishli yoki foydalanishga ruxsatingiz bor media fayllardan foydalaning."
     )
-
-
-def cleanup_prank_pages():
-    now = time.time()
-    expired = [
-        token for token, data in prank_pages.items()
-        if now - data["created_at"] > PRANK_TTL_SECONDS
-    ]
-    for token in expired:
-        prank_pages.pop(token, None)
 
 
 @router.message(CommandStart())
@@ -115,7 +154,7 @@ async def choose_round(message: Message):
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
     user_modes[message.from_user.id] = "916"
-    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
+    await message.answer("📱 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
 
 @router.message(F.text == BTN_LINK)
@@ -326,21 +365,11 @@ async def handle_prank_photo(message: Message):
 
     status = await message.answer("⏳ Prank sahifasi tayyorlanmoqda...")
     try:
-        tg_file = await bot.get_file(photo.file_id)
-        import io
-        buffer = io.BytesIO()
-        await bot.download_file(tg_file.file_path, destination=buffer)
-        image_bytes = buffer.getvalue()
-        if not image_bytes or len(image_bytes) > MAX_PRANK_IMAGE_BYTES:
-            raise ValueError("Rasm hajmi 5 MB dan katta yoki rasmni olib bo‘lmadi.")
-
-        cleanup_prank_pages()
-        token = secrets.token_urlsafe(18)
-        prank_pages[token] = {
-            "name": prank_names.get(user_id, "Do‘st"),
-            "image": base64.b64encode(image_bytes).decode("ascii"),
-            "created_at": time.time(),
-        }
+        # Rasmni server RAM'iga ko'chirmaymiz: Telegram file_id orqali keyin olinadi.
+        token = create_prank_token(
+            prank_names.get(user_id, "Do‘st"),
+            photo.file_id
+        )
         link = f"{BASE_URL}/prank/{token}"
         user_modes.pop(user_id, None)
         prank_names.pop(user_id, None)
@@ -376,17 +405,17 @@ async def fallback(message: Message):
 
 async def prank_page(request: web.Request):
     token = request.match_info["token"]
-    cleanup_prank_pages()
-    data = prank_pages.get(token)
+    data = read_prank_token(token)
     if not data:
         return web.Response(
-            text="<h2>Bu prank havolasi muddati tugagan yoki mavjud emas.</h2>",
+            text="<h2>Bu prank havolasi muddati tugagan yoki noto‘g‘ri.</h2>",
             content_type="text/html",
             status=404,
         )
 
-    safe_name = html.escape(data["name"])
-    image_data = data["image"]
+    # Ism HTML ichiga xavfsiz joylanadi.
+    safe_name = html.escape(data["name"], quote=True)
+    image_url = f"/prank/{token}/image"
     page = f"""<!doctype html>
 <html lang="uz">
 <head>
@@ -409,7 +438,7 @@ font-size:16px;font-weight:bold;background:#6d7cff;color:white;cursor:pointer;ma
 <section id="step">
 <h1>{safe_name}, sizga noodatiy xabar bor! 😳</h1>
 <p>Bu rasm siznikimi?</p>
-<img src="data:image/jpeg;base64,{image_data}" alt="Yuborilgan rasm">
+<img src="{image_url}" alt="Yuborilgan rasm">
 <button onclick="nextStep()">Keyingisini ko‘rish</button>
 </section>
 <p class="small">Bu sahifa hazil uchun tayyorlangan. Hech qanday ma’lumot yig‘ilmaydi.</p>
@@ -418,7 +447,7 @@ font-size:16px;font-weight:bold;background:#6d7cff;color:white;cursor:pointer;ma
 const screens = [
   ["Bir daqiqa... 👀", "Siz maxsus ASAVED prank sinoviga tushdingiz."],
   ["Oxirgi tekshiruv! 😮", "Kulishga tayyormisiz? Keyingi tugmani bosing."],
-  ["HAZIL EDI, UKA! 😂", "Qo‘rqib ketdingmi? Do‘sting sizga prank tayyorladi! 🤣"]
+  ["HAZIL EDI! 😂", "Do‘stingiz sizga prank tayyorladi! 🤣"]
 ];
 let index = 0;
 function nextStep() {{
@@ -434,6 +463,29 @@ function nextStep() {{
 }}
 </script></body></html>"""
     return web.Response(text=page, content_type="text/html")
+
+
+async def prank_image(request: web.Request):
+    token = request.match_info["token"]
+    data = read_prank_token(token)
+    if not data:
+        raise web.HTTPNotFound(text="Prank havolasi muddati tugagan yoki noto‘g‘ri.")
+
+    try:
+        telegram_file = await bot.get_file(data["file_id"])
+        buffer = BytesIO()
+        await bot.download_file(telegram_file.file_path, destination=buffer)
+        image_bytes = buffer.getvalue()
+        if not image_bytes:
+            raise RuntimeError("Telegram'dan rasm olinmadi")
+        return web.Response(
+            body=image_bytes,
+            content_type="image/jpeg",
+            headers={"Cache-Control": "private, max-age=300"}
+        )
+    except Exception:
+        log.exception("Prank image loading failed")
+        raise web.HTTPBadGateway(text="Rasmni yuklab bo‘lmadi. Keyinroq qayta urinib ko‘ring.")
 
 
 async def on_startup(app):
@@ -457,6 +509,7 @@ async def main():
     app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
     app.router.add_get("/health", lambda request: web.Response(text="ok"))
     app.router.add_get("/prank/{token}", prank_page)
+    app.router.add_get("/prank/{token}/image", prank_image)
 
     SimpleRequestHandler(
         dispatcher=dp,
