@@ -1,41 +1,27 @@
-
 import asyncio
+import base64
+import html
 import logging
 import os
 import re
+import secrets
+import time
 import tempfile
-import io
 from pathlib import Path
 from urllib.parse import urlparse
 
-import qrcode
-from PIL import Image, ImageDraw
-
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message,
-    CallbackQuery,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    FSInputFile
+    Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 )
-from aiogram.webhook.aiohttp_server import (
-    SimpleRequestHandler,
-    setup_application
-)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("asaved")
-
-# =========================
-# SOZLAMALAR
-# =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -43,1153 +29,449 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-CHANNEL_ID = "@ReklamaBozoriUzz"
-CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
-
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN kiritilmagan")
-
-if not WEBHOOK_SECRET or not re.fullmatch(
-    r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET
-):
-    raise RuntimeError("WEBHOOK_SECRET noto'g'ri")
-
+    raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
+if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
+    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin; faqat harf, raqam, _ yoki - ishlating")
 if not BASE_URL:
-    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi")
+    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring")
 
-bot = Bot(
-    BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# =========================
-# LIMITLAR
-# =========================
-
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_OUTPUT_BYTES = 49 * 1024 * 1024
-MAX_LINK_BYTES = 49 * 1024 * 1024
-MAX_SECONDS = 600
-MAX_QR_TEXT = 2000
-
-ALLOWED_HOSTS = {
-    "youtube.com",
-    "www.youtube.com",
-    "m.youtube.com",
-    "youtu.be",
-    "instagram.com",
-    "www.instagram.com",
-    "m.instagram.com",
-    "tiktok.com",
-    "www.tiktok.com",
-    "vm.tiktok.com",
-    "vt.tiktok.com",
-}
-
-# =========================
-# FOYDALANUVCHI HOLATLARI
-# =========================
-
-user_modes: dict[int, str] = {}
-
-# QR yaratish uchun vaqtinchalik ma'lumotlar
-qr_modes: dict[int, str] = {}
-qr_data: dict[int, str] = {}
-
-# =========================
-# ASOSIY MENYU
-# =========================
-
 BTN_ROUND = "🎥 Dumaloq video"
-BTN_916 = "📱 9:16 format"
 BTN_LINK = "🔗 Video havolasi"
-BTN_QR = "📷 QR kod yasash"
+BTN_916 = "📱 9:16 format"
+BTN_PRANK = "😂 Do‘stga Prank"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
-        [
-            KeyboardButton(text=BTN_ROUND),
-            KeyboardButton(text=BTN_916)
-        ],
+        [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
         [KeyboardButton(text=BTN_LINK)],
-        [KeyboardButton(text=BTN_QR)]
+        [KeyboardButton(text=BTN_PRANK)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
 )
 
-def main_text():
+# Foydalanuvchining keyingi amali.
+user_modes: dict[int, str] = {}
+prank_names: dict[int, str] = {}
+
+# Prank sahifalari RAM'da saqlanadi. Render qayta ishga tushsa, havolalar yangidan yaratiladi.
+# Har bir sahifa 24 soatgacha ishlaydi.
+PRANK_TTL_SECONDS = 24 * 60 * 60
+MAX_PRANK_IMAGE_BYTES = 5 * 1024 * 1024
+prank_pages: dict[str, dict] = {}
+
+ALLOWED_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+    "instagram.com", "www.instagram.com",
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+}
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_OUTPUT_BYTES = 49 * 1024 * 1024
+MAX_LINK_BYTES = 49 * 1024 * 1024
+MAX_SECONDS = 600
+
+
+def main_text() -> str:
     return (
-        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz! 🚀\n\n"
-        "🎥 <b>Dumaloq video</b> — videoni Telegram dumaloq videosiga aylantirish.\n"
-        "📱 <b>9:16 format</b> — videoni Reels formatiga moslash.\n"
-        "🔗 <b>Video havolasi</b> — YouTube, Instagram va TikTok videolarini olish.\n"
-        "📷 <b>QR kod yasash</b> — rasmli yoki oddiy QR kod yaratish.\n\n"
-        "Kerakli xizmatni menyudan tanlang! ❤️"
-    )
-
-# =========================
-# MAJBURIY OBUNA
-# =========================
-
-def subscription_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="📢 Kanalga obuna bo'lish",
-                    url=CHANNEL_URL
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="✅ Obunani tekshirish",
-                    callback_data="check_subscription"
-                )
-            ]
-        ]
+        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\\n\\n"
+        "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\\n"
+        "📱 <b>9:16 format</b> — galereyadan video yuboring.\\n"
+        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\\n"
+        "😂 <b>Do‘stga Prank</b> — do‘stingiz uchun kulgili prank havolasi yarating.\\n\\n"
+        "Faqat o‘zingizga tegishli yoki foydalanishga ruxsatingiz bor media fayllardan foydalaning."
     )
 
 
-async def is_subscribed(user_id: int) -> bool:
-    member = await bot.get_chat_member(
-        chat_id=CHANNEL_ID,
-        user_id=user_id
-    )
+def cleanup_prank_pages():
+    now = time.time()
+    expired = [
+        token for token, data in prank_pages.items()
+        if now - data["created_at"] > PRANK_TTL_SECONDS
+    ]
+    for token in expired:
+        prank_pages.pop(token, None)
 
-    if member.status in (
-        ChatMemberStatus.MEMBER,
-        ChatMemberStatus.ADMINISTRATOR,
-        ChatMemberStatus.CREATOR
-    ):
-        return True
-
-    if (
-        member.status == ChatMemberStatus.RESTRICTED
-        and member.is_member
-    ):
-        return True
-
-    return False
-
-
-async def ask_subscription(message: Message):
-    await message.answer(
-        "🔒 <b>ASAVED botidan foydalanish uchun</b>\n\n"
-        "Avval kanalimizga obuna bo'ling:\n\n"
-        "📢 @ReklamaBozoriUzz\n\n"
-        "Obuna bo'lgach, tekshirish tugmasini bosing.",
-        reply_markup=subscription_keyboard()
-    )
-
-
-class SubscriptionMiddleware(BaseMiddleware):
-
-    async def __call__(self, handler, event, data):
-
-        user = getattr(event, "from_user", None)
-
-        if not user:
-            return await handler(event, data)
-
-        if (
-            isinstance(event, CallbackQuery)
-            and event.data in (
-                "check_subscription",
-                "qr_plain"
-            )
-        ):
-            if event.data == "check_subscription":
-                return await handler(event, data)
-
-        try:
-            subscribed = await is_subscribed(user.id)
-
-        except Exception:
-            log.exception("Subscription check failed")
-
-            if isinstance(event, Message):
-                await event.answer(
-                    "⚠️ Obunani tekshirishda xatolik. "
-                    "Birozdan keyin urinib ko'ring."
-                )
-
-            elif isinstance(event, CallbackQuery):
-                await event.answer(
-                    "Obunani tekshirishda xatolik.",
-                    show_alert=True
-                )
-
-            return
-
-        if not subscribed:
-
-            if isinstance(event, Message):
-                await ask_subscription(event)
-
-            elif isinstance(event, CallbackQuery):
-                await event.answer(
-                    "Avval kanalga obuna bo'ling!",
-                    show_alert=True
-                )
-
-            return
-
-        return await handler(event, data)
-
-
-router.message.middleware(SubscriptionMiddleware())
-router.callback_query.middleware(SubscriptionMiddleware())
-
-# =========================
-# OBUNANI TASDIQLASH
-# =========================
-
-@router.callback_query(F.data == "check_subscription")
-async def check_subscription(callback: CallbackQuery):
-
-    try:
-        subscribed = await is_subscribed(callback.from_user.id)
-
-        if subscribed:
-
-            await callback.answer("✅ Obuna tasdiqlandi!")
-
-            user_modes.pop(callback.from_user.id, None)
-            qr_modes.pop(callback.from_user.id, None)
-            qr_data.pop(callback.from_user.id, None)
-
-            await callback.message.delete()
-
-            await callback.message.answer(
-                main_text(),
-                reply_markup=keyboard
-            )
-
-        else:
-            await callback.answer(
-                "❌ Avval kanalga obuna bo'ling!",
-                show_alert=True
-            )
-
-    except Exception:
-        log.exception("Subscription callback error")
-
-        await callback.answer(
-            "Tekshirishda xatolik.",
-            show_alert=True
-        )
-
-# =========================
-# START
-# =========================
 
 @router.message(CommandStart())
 async def start(message: Message):
+    user_modes.pop(message.from_user.id, None)
+    prank_names.pop(message.from_user.id, None)
+    await message.answer(main_text(), reply_markup=keyboard)
 
-    user_id = message.from_user.id
-
-    user_modes.pop(user_id, None)
-    qr_modes.pop(user_id, None)
-    qr_data.pop(user_id, None)
-
-    await message.answer(
-        main_text(),
-        reply_markup=keyboard
-    )
-
-# =========================
-# MENYU FUNKSIYALARI
-# =========================
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
-
-    user_id = message.from_user.id
-
-    qr_modes.pop(user_id, None)
-    qr_data.pop(user_id, None)
-
-    user_modes[user_id] = "round"
-
-    await message.answer(
-        "🎥 <b>Dumaloq video</b>\n\n"
-        "Endi galereyadan 60 soniyagacha video yuboring."
-    )
+    user_modes[message.from_user.id] = "round"
+    await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
 
 
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
-
-    user_id = message.from_user.id
-
-    qr_modes.pop(user_id, None)
-    qr_data.pop(user_id, None)
-
-    user_modes[user_id] = "916"
-
-    await message.answer(
-        "📱 <b>9:16 format</b>\n\n"
-        "Endi formatga o'tkazish uchun videoni yuboring."
-    )
+    user_modes[message.from_user.id] = "916"
+    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
 
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
+    user_modes[message.from_user.id] = "link"
+    await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
 
-    user_id = message.from_user.id
 
-    qr_modes.pop(user_id, None)
-    qr_data.pop(user_id, None)
-
-    user_modes[user_id] = "link"
-
+@router.message(F.text == BTN_PRANK)
+async def choose_prank(message: Message):
+    user_modes[message.from_user.id] = "prank_name"
+    prank_names.pop(message.from_user.id, None)
     await message.answer(
-        "🔗 <b>Video havolasi</b>\n\n"
-        "YouTube, Instagram yoki TikTok video havolasini yuboring."
+        "😂 <b>DO‘STGA PRANK</b>\\n\\n"
+        "1️⃣ Do‘stingizning ismini yozing.\\n"
+        "Keyin uning rasmini yuborasiz.\\n\\n"
+        "Eslatma: faqat ulashishga ruxsatingiz bor rasmni yuboring. "
+        "Prank sahifasining oxirida bu hazil ekani ochiq ko‘rsatiladi."
     )
 
-
-# =========================
-# QR KOD MENYUSI
-# =========================
-
-@router.message(F.text == BTN_QR)
-async def choose_qr(message: Message):
-
-    user_id = message.from_user.id
-
-    user_modes.pop(user_id, None)
-
-    qr_modes[user_id] = "content"
-    qr_data.pop(user_id, None)
-
-    await message.answer(
-        "📷 <b>QR KOD YASASH</b>\n\n"
-        "QR kod ichiga joylashtirmoqchi bo'lgan "
-        "matn yoki havolani yuboring.\n\n"
-        "Masalan:\n"
-        "https://t.me/ReklamaBozoriUzz"
-    )
-
-
-def qr_skip_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Rasmsiz QR yaratish",
-                    callback_data="qr_plain"
-                )
-            ]
-        ]
-    )
-
-
-async def create_qr(
-    content: str,
-    output: Path,
-    logo_path: Path | None = None
-):
-    def generate():
-
-        qr = qrcode.QRCode(
-            version=None,
-            error_correction=qrcode.constants.ERROR_CORRECT_H,
-            box_size=12,
-            border=4
-        )
-
-        qr.add_data(content)
-        qr.make(fit=True)
-
-        image = qr.make_image(
-            fill_color="black",
-            back_color="white"
-        ).convert("RGB")
-
-        if logo_path and logo_path.exists():
-
-            logo = Image.open(logo_path).convert("RGBA")
-
-            max_logo_size = int(image.size[0] * 0.20)
-
-            logo.thumbnail(
-                (max_logo_size, max_logo_size),
-                Image.Resampling.LANCZOS
-            )
-
-            padding = 12
-
-            background_size = (
-                logo.width + padding * 2,
-                logo.height + padding * 2
-            )
-
-            background = Image.new(
-                "RGBA",
-                background_size,
-                "white"
-            )
-
-            mask = Image.new(
-                "L",
-                background_size,
-                0
-            )
-
-            draw = ImageDraw.Draw(mask)
-
-            draw.rounded_rectangle(
-                (0, 0, background_size[0] - 1,
-                 background_size[1] - 1),
-                radius=12,
-                fill=255
-            )
-
-            background.putalpha(mask)
-
-            background.alpha_composite(
-                logo,
-                (padding, padding)
-            )
-
-            position = (
-                (image.width - background.width) // 2,
-                (image.height - background.height) // 2
-            )
-
-            image.paste(
-                background,
-                position,
-                background
-            )
-
-        image.save(output, format="PNG")
-
-    await asyncio.to_thread(generate)
-
-
-@router.callback_query(F.data == "qr_plain")
-async def qr_plain(callback: CallbackQuery):
-
-    user_id = callback.from_user.id
-
-    content = qr_data.get(user_id)
-
-    if not content:
-        await callback.answer(
-            "QR ma'lumoti topilmadi.",
-            show_alert=True
-        )
-        return
-
-    await callback.answer("QR tayyorlanmoqda...")
-
-    status = await callback.message.answer(
-        "⏳ QR kod tayyorlanmoqda..."
-    )
-
-    try:
-
-        with tempfile.TemporaryDirectory(
-            prefix="asaved_qr_"
-        ) as tmp:
-
-            output = Path(tmp) / "asaved_qr.png"
-
-            await create_qr(
-                content,
-                output
-            )
-
-            await callback.message.answer_photo(
-                FSInputFile(output),
-                caption="✅ <b>ASAVED QR kod tayyor!</b>"
-            )
-
-        await status.delete()
-
-    except Exception:
-        log.exception("QR generation failed")
-
-        await status.edit_text(
-            "❌ QR kod yaratishda xatolik yuz berdi."
-        )
-
-    finally:
-        qr_modes.pop(user_id, None)
-        qr_data.pop(user_id, None)
-
-
-# =========================
-# QR UCHUN RASM QABUL QILISH
-# =========================
-
-@router.message(F.photo)
-async def handle_qr_photo(message: Message):
-
-    user_id = message.from_user.id
-
-    if qr_modes.get(user_id) != "logo":
-        await message.answer(
-            "Avval kerakli menyuni tanlang."
-        )
-        return
-
-    status = await message.answer(
-        "⏳ Rasmli QR kod tayyorlanmoqda..."
-    )
-
-    try:
-
-        with tempfile.TemporaryDirectory(
-            prefix="asaved_qr_logo_"
-        ) as tmp:
-
-            folder = Path(tmp)
-
-            logo_path = folder / "logo.jpg"
-            output = folder / "asaved_qr.png"
-
-            photo = message.photo[-1]
-
-            tg_file = await bot.get_file(
-                photo.file_id
-            )
-
-            await bot.download_file(
-                tg_file.file_path,
-                destination=logo_path
-            )
-
-            await create_qr(
-                qr_data[user_id],
-                output,
-                logo_path
-            )
-
-            await message.answer_photo(
-                FSInputFile(output),
-                caption="✅ <b>Rasmli QR kod tayyor!</b>"
-            )
-
-        await status.delete()
-
-    except Exception:
-        log.exception("QR logo error")
-
-        await status.edit_text(
-            "❌ Rasmli QR kod yaratishda xatolik."
-        )
-
-    finally:
-        qr_modes.pop(user_id, None)
-        qr_data.pop(user_id, None)
-
-
-# =========================
-# VIDEO MA'LUMOTLARI
-# =========================
 
 def get_video_info(message: Message):
-
     if message.video:
-
-        return (
-            message.video.file_id,
-            message.video.file_size,
-            message.video.duration
-        )
-
-    if (
-        message.document
-        and (message.document.mime_type or "").startswith("video/")
-    ):
-
-        return (
-            message.document.file_id,
-            message.document.file_size,
-            None
-        )
-
+        return message.video.file_id, message.video.file_size, message.video.duration, "video.mp4"
+    if message.document and (message.document.mime_type or "").startswith("video/"):
+        return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
     return None
 
 
-async def download_telegram_video(
-    message: Message,
-    target: Path
-):
-
+async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
     info = get_video_info(message)
-
     if not info:
-        raise ValueError("Video topilmadi.")
-
-    file_id, size, duration = info
-
+        raise ValueError("Video topilmadi. Iltimos, video fayl yuboring.")
+    file_id, size, duration, filename = info
     if size and size > MAX_UPLOAD_BYTES:
-        raise ValueError("Video 20 MB dan katta.")
-
+        raise ValueError("Video 20 MB dan katta. Telegram bot orqali bunday faylni olish imkoni yo‘q; kichikroq video yuboring.")
     if duration and duration > MAX_SECONDS:
-        raise ValueError("Video 10 daqiqadan uzun.")
-
+        raise ValueError("Video 10 daqiqadan uzun. Qisqaroq video yuboring.")
     tg_file = await bot.get_file(file_id)
+    await bot.download_file(tg_file.file_path, destination=target)
+    return target, duration
 
-    await bot.download_file(
-        tg_file.file_path,
-        destination=target
-    )
-
-    return target
-
-
-# =========================
-# FFMPEG
-# =========================
 
 async def run_ffmpeg(args: list[str]):
-
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-
     _, stderr = await proc.communicate()
-
     if proc.returncode != 0:
-
-        raise RuntimeError(
-            stderr.decode(
-                "utf-8",
-                "ignore"
-            )[-1200:] or "FFmpeg xatoligi"
-        )
+        raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
 
 
 async def make_round(src: Path, dst: Path):
-
     await run_ffmpeg([
         "-i", str(src),
         "-t", "60",
-        "-vf",
-        "scale=640:640:force_original_aspect_ratio=increase,"
-        "crop=640:640,setsar=1",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "27",
-        "-c:a", "aac",
-        "-b:a", "96k",
-        "-ac", "2",
-        "-movflags", "+faststart",
-        str(dst)
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase,crop=640:640,setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-movflags", "+faststart", str(dst)
     ])
 
 
 async def make_916(src: Path, dst: Path):
-
     await run_ffmpeg([
         "-i", str(src),
-        "-vf",
-        "scale=720:1280:force_original_aspect_ratio=increase,"
-        "crop=720:1280,setsar=1",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "26",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        str(dst)
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", str(dst)
     ])
 
 
-# =========================
-# VIDEO QAYTA ISHLASH
-# =========================
-
-async def process_uploaded_video(
-    message: Message,
-    mode: str
-):
-
-    status = await message.answer(
-        "⏳ Video tayyorlanmoqda..."
-    )
-
+async def process_uploaded_video(message: Message, mode: str):
+    status = await message.answer("⏳ Video tayyorlanmoqda...")
     try:
-
-        with tempfile.TemporaryDirectory(
-            prefix="asaved_"
-        ) as tmp:
-
+        with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
             folder = Path(tmp)
-
             src = folder / "input_video"
             dst = folder / "output.mp4"
-
-            await download_telegram_video(
-                message,
-                src
-            )
-
+            await download_telegram_video(message, src)
             if mode == "round":
-
                 await make_round(src, dst)
-
                 if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError(
-                        "Tayyor video 49 MB dan katta."
-                    )
-
-                await message.answer_video_note(
-                    FSInputFile(dst)
-                )
-
-            elif mode == "916":
-
+                    raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
+                await message.answer_video_note(FSInputFile(dst))
+            else:
                 await make_916(src, dst)
-
                 if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                    raise ValueError(
-                        "Tayyor video 49 MB dan katta."
-                    )
-
-                await message.answer_video(
-                    FSInputFile(dst),
-                    caption="📱 9:16 format tayyor!"
-                )
-
+                    raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
+                await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
         await status.delete()
-
     except Exception as exc:
-
         log.exception("Video processing failed")
-
-        await status.edit_text(
-            f"❌ Xatolik: {str(exc)[:700]}"
-        )
-
+        await status.edit_text(f"❌ Xatolik: {str(exc)[:700]}")
     finally:
         user_modes.pop(message.from_user.id, None)
 
 
-# =========================
-# VIDEO HAVOLASINI TEKSHIRISH
-# =========================
-
 def valid_video_url(raw: str) -> bool:
-
     try:
-
         parsed = urlparse(raw.strip())
         host = (parsed.hostname or "").lower()
-
-        return (
-            parsed.scheme == "https"
-            and (
-                host in ALLOWED_HOSTS
-                or any(
-                    host.endswith("." + h)
-                    for h in ALLOWED_HOSTS
-                )
-            )
+        return parsed.scheme == "https" and (
+            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
         )
-
     except Exception:
         return False
 
 
-# =========================
-# HAVOLADAN VIDEO YUKLASH
-# =========================
-
-async def download_public_link(
-    url: str,
-    folder: Path
-) -> Path:
-
+async def download_public_link(url: str, folder: Path) -> Path:
     try:
         import yt_dlp
-
     except ImportError:
-        raise RuntimeError(
-            "yt-dlp o'rnatilmagan."
-        )
+        raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
 
-    output_template = str(
-        folder / "link_video.%(ext)s"
-    )
-
+    output_template = str(folder / "link_video.%(ext)s")
     options = {
-        # Mavjud fayl formatini imkon qadar saqlash
-        "format": "best[height<=1080]/best",
-
+        "format": "best[ext=mp4][height<=1080]/best[height<=1080]/best",
         "outtmpl": output_template,
-
         "noplaylist": True,
         "max_filesize": MAX_LINK_BYTES,
         "socket_timeout": 25,
         "retries": 2,
         "quiet": True,
         "no_warnings": True,
-
-        # Majburiy MP4 konvertatsiyasi yo'q
-        "overwrites": True,
+        "merge_output_format": "mp4",
     }
 
     def do_download():
-
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
 
     await asyncio.to_thread(do_download)
-
-    files = [
-        p for p in folder.iterdir()
-        if p.is_file()
-        and p.name.startswith("link_video.")
-        and not p.name.endswith((".part", ".ytdl"))
-    ]
-
+    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
     if not files:
-        raise RuntimeError(
-            "Video topilmadi yoki platforma yuklashga ruxsat bermadi."
-        )
-
-    result = max(
-        files,
-        key=lambda p: p.stat().st_size
-    )
-
+        raise RuntimeError("Video topilmadi yoki platforma yuklashga ruxsat bermadi.")
+    result = max(files, key=lambda p: p.stat().st_size)
     if result.stat().st_size > MAX_LINK_BYTES:
-        raise RuntimeError(
-            "Video 49 MB dan katta."
-        )
-
+        raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
     return result
 
 
-# =========================
-# MATN XABARLARI
-# =========================
-
 @router.message(F.text)
 async def handle_text(message: Message):
-
-    user_id = message.from_user.id
     text = (message.text or "").strip()
-
+    user_id = message.from_user.id
     mode = user_modes.get(user_id)
-    qr_mode = qr_modes.get(user_id)
 
-    # QR uchun matn yoki havola qabul qilish
-    if qr_mode == "content":
-
-        if len(text) > MAX_QR_TEXT:
-            await message.answer(
-                "❌ Matn juda uzun. 2000 belgigacha yuboring."
-            )
+    if mode == "prank_name":
+        if not 2 <= len(text) <= 40:
+            await message.answer("Ism 2 tadan 40 tagacha belgidan iborat bo‘lsin. Qayta yozing.")
             return
-
-        if not text:
-            await message.answer("Matn bo'sh bo'lmasin.")
-            return
-
-        qr_data[user_id] = text
-        qr_modes[user_id] = "logo"
-
+        prank_names[user_id] = text
+        user_modes[user_id] = "prank_photo"
         await message.answer(
-            "🖼️ <b>QR markaziga rasm qo'shmoqchimisiz?</b>\n\n"
-            "Rasm yuboring yoki rasmsiz QR yaratish tugmasini bosing.",
-            reply_markup=qr_skip_keyboard()
+            f"✅ Ism qabul qilindi: <b>{html.escape(text)}</b>\\n\\n"
+            "Endi do‘stingizning rasmini <b>foto</b> ko‘rinishida yuboring."
         )
-
         return
 
-    # QR uchun rasm kutilmoqda
-    if qr_mode == "logo":
-
-        if text.lower() in (
-            "tayyorla",
-            "rasmsiz",
-            "skip"
-        ):
-
-            content = qr_data.get(user_id)
-
-            if not content:
-                return
-
-            await message.answer(
-                "⏳ QR tayyorlanmoqda..."
-            )
-
-            try:
-
-                with tempfile.TemporaryDirectory(
-                    prefix="asaved_qr_"
-                ) as tmp:
-
-                    output = Path(tmp) / "qr.png"
-
-                    await create_qr(
-                        content,
-                        output
-                    )
-
-                    await message.answer_photo(
-                        FSInputFile(output),
-                        caption="✅ QR kod tayyor!"
-                    )
-
-            except Exception:
-                log.exception("QR error")
-
-                await message.answer(
-                    "QR yaratishda xatolik."
-                )
-
-            finally:
-                qr_modes.pop(user_id, None)
-                qr_data.pop(user_id, None)
-
-        else:
-            await message.answer(
-                "Rasm yuboring yoki quyidagi tugmani bosing.",
-                reply_markup=qr_skip_keyboard()
-            )
-
+    if mode == "prank_photo":
+        await message.answer("📸 Iltimos, rasmni Telegram'ga foto qilib yuboring.")
         return
 
-    # Video havolasi
     if mode == "link":
-
         if not valid_video_url(text):
-
-            await message.answer(
-                "❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring."
-            )
-
+            await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
             return
-
-        status = await message.answer(
-            "⏳ Havoladan video olinmoqda..."
-        )
-
+        status = await message.answer("⏳ Havola tekshirilmoqda va video olinmoqda...")
         try:
-
-            with tempfile.TemporaryDirectory(
-                prefix="asaved_link_"
-            ) as tmp:
-
-                folder = Path(tmp)
-
-                video_path = await download_public_link(
-                    text,
-                    folder
-                )
-
-                # Document sifatida yuboriladi:
-                # original formatni saqlash uchun
-                await message.answer_document(
-                    FSInputFile(video_path),
-                    caption=(
-                        "✅ <b>Video tayyor!</b>\n"
-                        f"📁 Format: {video_path.suffix.lower()}"
-                    )
-                )
-
+            with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
+                video_path = await download_public_link(text, Path(tmp))
+                await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
             await status.delete()
-
         except Exception:
             log.exception("Link download failed")
-
             await status.edit_text(
-                "❌ Videoni olib bo'lmadi.\n\n"
-                "Sabab: havola yopiq bo'lishi, platforma cheklovi "
-                "yoki video hajmi bo'lishi mumkin.\n\n"
-                "Faqat o'zingizga tegishli yoki yuklashga ruxsatingiz "
-                "bor ochiq videoni sinab ko'ring."
+                "❌ Videoni olib bo‘lmadi. Havola yopiq, platforma cheklovi yoki video hajmi sabab bo‘lishi mumkin. "
+                "O‘zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko‘ring."
             )
-
         finally:
             user_modes.pop(user_id, None)
-
         return
 
-    # Video rejimida matn yuborilsa
     if mode in ("round", "916"):
-
-        await message.answer(
-            "Iltimos, havola emas, galereyadan video fayl yuboring."
-        )
-
+        await message.answer("Iltimos, havola emas, galereyadan video fayl yuboring.")
         return
 
     if valid_video_url(text):
-
-        await message.answer(
-            "Avval 🔗 Video havolasi tugmasini bosing."
-        )
-
+        await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
     else:
+        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
-        await message.answer(
-            "Menyudan kerakli funksiyani tanlang.",
-            reply_markup=keyboard
+
+@router.message(F.photo)
+async def handle_prank_photo(message: Message):
+    user_id = message.from_user.id
+    if user_modes.get(user_id) != "prank_photo":
+        await message.answer("Rasm bilan ishlash uchun avval menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+        return
+
+    photo = message.photo[-1]
+    if photo.file_size and photo.file_size > MAX_PRANK_IMAGE_BYTES:
+        await message.answer("❌ Rasm 5 MB dan katta. Iltimos, kichikroq rasm yuboring.")
+        return
+
+    status = await message.answer("⏳ Prank sahifasi tayyorlanmoqda...")
+    try:
+        tg_file = await bot.get_file(photo.file_id)
+        import io
+        buffer = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=buffer)
+        image_bytes = buffer.getvalue()
+        if not image_bytes or len(image_bytes) > MAX_PRANK_IMAGE_BYTES:
+            raise ValueError("Rasm hajmi 5 MB dan katta yoki rasmni olib bo‘lmadi.")
+
+        cleanup_prank_pages()
+        token = secrets.token_urlsafe(18)
+        prank_pages[token] = {
+            "name": prank_names.get(user_id, "Do‘st"),
+            "image": base64.b64encode(image_bytes).decode("ascii"),
+            "created_at": time.time(),
+        }
+        link = f"{BASE_URL}/prank/{token}"
+        user_modes.pop(user_id, None)
+        prank_names.pop(user_id, None)
+
+        await status.edit_text(
+            "🎉 <b>Prank tayyor!</b>\\n\\n"
+            f"Do‘stingizga yuborish uchun havola:\\n{link}\\n\\n"
+            "⏳ Havola 24 soatgacha ishlaydi. Sahifadagi oxirgi qadamda hazil ekani ochiq aytiladi."
         )
+    except Exception as exc:
+        log.exception("Prank creation failed")
+        await status.edit_text(f"❌ Prank yaratilmadi: {html.escape(str(exc)[:300])}")
+        user_modes.pop(user_id, None)
+        prank_names.pop(user_id, None)
 
-
-# =========================
-# VIDEO QABUL QILISH
-# =========================
 
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
-
-    user_id = message.from_user.id
-
-    mode = user_modes.get(user_id)
-
+    mode = user_modes.get(message.from_user.id)
     if mode not in ("round", "916"):
-
-        await message.answer(
-            "Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang."
-        )
-
+        await message.answer("Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang.")
         return
-
     if not get_video_info(message):
-
-        await message.answer(
-            "Iltimos, video fayl yuboring."
-        )
-
+        await message.answer("Iltimos, video fayl yuboring.")
         return
+    await process_uploaded_video(message, mode)
 
-    await process_uploaded_video(
-        message,
-        mode
-    )
-
-
-# =========================
-# BOSHQA XABARLAR
-# =========================
 
 @router.message()
 async def fallback(message: Message):
-
-    await message.answer(
-        "Menyudan kerakli funksiyani tanlang.",
-        reply_markup=keyboard
-    )
+    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
 
-# =========================
-# WEBHOOK
-# =========================
+async def prank_page(request: web.Request):
+    token = request.match_info["token"]
+    cleanup_prank_pages()
+    data = prank_pages.get(token)
+    if not data:
+        return web.Response(
+            text="<h2>Bu prank havolasi muddati tugagan yoki mavjud emas.</h2>",
+            content_type="text/html",
+            status=404,
+        )
 
-async def on_startup():
+    safe_name = html.escape(data["name"])
+    image_data = data["image"]
+    page = f"""<!doctype html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASAVED Prank</title>
+<style>
+*{{box-sizing:border-box}} body{{margin:0;min-height:100vh;background:#10131c;color:#fff;
+font-family:Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:20px}}
+.card{{width:100%;max-width:440px;background:#1b2030;border:1px solid #343b50;border-radius:22px;
+padding:24px;text-align:center;box-shadow:0 18px 55px #0008}}
+.tag{{color:#aab5d1;font-size:12px;letter-spacing:2px}} h1{{font-size:26px;margin:14px 0}}
+p{{color:#d5d9e5;line-height:1.5}} img{{width:100%;max-height:360px;object-fit:contain;border-radius:14px;
+background:#0c0f17;margin:12px 0}} button{{width:100%;border:0;border-radius:13px;padding:15px;
+font-size:16px;font-weight:bold;background:#6d7cff;color:white;cursor:pointer;margin-top:12px}}
+.small{{font-size:12px;color:#9da6bb;margin-top:16px}}
+</style></head>
+<body><main class="card">
+<div class="tag">ASAVED • DO‘STGA PRANK</div>
+<section id="step">
+<h1>{safe_name}, sizga noodatiy xabar bor! 😳</h1>
+<p>Bu rasm siznikimi?</p>
+<img src="data:image/jpeg;base64,{image_data}" alt="Yuborilgan rasm">
+<button onclick="nextStep()">Keyingisini ko‘rish</button>
+</section>
+<p class="small">Bu sahifa hazil uchun tayyorlangan. Hech qanday ma’lumot yig‘ilmaydi.</p>
+</main>
+<script>
+const screens = [
+  ["Bir daqiqa... 👀", "Siz maxsus ASAVED prank sinoviga tushdingiz."],
+  ["Oxirgi tekshiruv! 😮", "Kulishga tayyormisiz? Keyingi tugmani bosing."],
+  ["HAZIL EDI, UKA! 😂", "Qo‘rqib ketdingmi? Do‘sting sizga prank tayyorladi! 🤣"]
+];
+let index = 0;
+function nextStep() {{
+  const section = document.getElementById("step");
+  if (index < screens.length) {{
+    const item = screens[index++];
+    section.innerHTML = "<h1>" + item[0] + "</h1><p>" + item[1] + "</p>" +
+      (index === screens.length ? "<div style='font-size:54px'>🤣😂🤣</div>" : "") +
+      "<button onclick='nextStep()'>" + (index === screens.length ? "Yakunlash" : "Keyingisini ko‘rish") + "</button>";
+  }} else {{
+    section.innerHTML = "<h1>Prank tugadi! 😂</h1><p>ASAVED orqali tayyorlangan hazil.</p>";
+  }}
+}}
+</script></body></html>"""
+    return web.Response(text=page, content_type="text/html")
 
-    webhook_url = (
-        f"{BASE_URL}/{WEBHOOK_PATH}"
-    )
 
+async def on_startup(app):
+    webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
         allowed_updates=dp.resolve_used_update_types()
     )
-
-    log.info(
-        "Webhook set: %s",
-        webhook_url
-    )
+    log.info("Webhook set: %s", webhook_url)
 
 
-async def on_shutdown():
-
-    await bot.delete_webhook(
-        drop_pending_updates=False
-    )
-
+async def on_shutdown(app):
+    await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
 
 
-# =========================
-# SERVER
-# =========================
-
 async def main():
-
-    app = web.Application(
-        client_max_size=2 * 1024 * 1024
-    )
-
-    app.router.add_get(
-        "/",
-        lambda request: web.Response(
-            text="ASAVED bot is running"
-        )
-    )
-
-    app.router.add_get(
-        "/health",
-        lambda request: web.Response(text="ok")
-    )
+    app = web.Application(client_max_size=2 * 1024 * 1024)
+    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
+    app.router.add_get("/health", lambda request: web.Response(text="ok"))
+    app.router.add_get("/prank/{token}", prank_page)
 
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
         secret_token=WEBHOOK_SECRET
-    ).register(
-        app,
-        path=f"/{WEBHOOK_PATH}"
-    )
-
-    setup_application(
-        app,
-        dp,
-        bot=bot
-    )
-
-    app.on_startup.append(
-        lambda app: on_startup()
-    )
-
-    app.on_cleanup.append(
-        lambda app: on_shutdown()
-    )
+    ).register(app, path=f"/{WEBHOOK_PATH}")
+    setup_application(app, dp, bot=bot)
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_shutdown)
 
     runner = web.AppRunner(app)
-
     await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        "0.0.0.0",
-        PORT
-    )
-
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-
-    log.info(
-        "ASAVED listening on port %s",
-        PORT
-    )
-
+    log.info("ASAVED listening on port %s", PORT)
     await asyncio.Event().wait()
 
 
