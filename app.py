@@ -2,20 +2,22 @@ import asyncio
 import logging
 import os
 import re
-import shutil
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
+from typing import Any, Awaitable, Callable
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import CommandStart
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
-    Video, Document, ReplyKeyboardRemove, FSInputFile
+    Video, Document, ReplyKeyboardRemove, FSInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
+from aiogram import BaseMiddleware
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO)
@@ -26,6 +28,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+CHANNEL_USERNAME = "@ReklamaBozoriUzz"
+CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
@@ -52,6 +57,13 @@ keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Kerakli funksiyani tanlang"
 )
 
+subscribe_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")],
+    ]
+)
+
 # Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
 user_modes: dict[int, str] = {}
 
@@ -61,10 +73,11 @@ ALLOWED_HOSTS = {
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
 }
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # Telegram cloud Bot API getFile cheklovi
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
+
 
 def main_text() -> str:
     return (
@@ -75,25 +88,88 @@ def main_text() -> str:
         "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
 
+
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
+        return member.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+        }
+    except Exception:
+        log.exception("Kanal obunasini tekshirishda xatolik")
+        return False
+
+
+async def send_subscription_required(message: Message):
+    await message.answer(
+        "⛔ Botdan foydalanish uchun avval kanalimizga obuna bo‘ling.\n"
+        "Obuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.",
+        reply_markup=subscribe_keyboard,
+    )
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: dict[str, Any],
+    ) -> Any:
+        if not event.from_user:
+            return await handler(event, data)
+
+        if await is_subscribed(event.from_user.id):
+            return await handler(event, data)
+
+        await send_subscription_required(event)
+        return None
+
+
+router.message.middleware(SubscriptionMiddleware())
+
+
+@router.callback_query(F.data == "check_subscription")
+async def check_subscription_callback(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
+        return
+
+    if await is_subscribed(callback.from_user.id):
+        await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
+        if callback.message:
+            await callback.message.answer(main_text(), reply_markup=keyboard)
+    else:
+        await callback.answer(
+            "❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!",
+            show_alert=True,
+        )
+
+
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
+
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
     user_modes[message.from_user.id] = "round"
     await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
 
+
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
     user_modes[message.from_user.id] = "916"
     await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
+
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
     user_modes[message.from_user.id] = "link"
     await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
 
 def get_video_info(message: Message):
     if message.video:
@@ -102,18 +178,20 @@ def get_video_info(message: Message):
         return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
     return None
 
+
 async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
     info = get_video_info(message)
     if not info:
         raise ValueError("Video topilmadi. Iltimos, video fayl yuboring.")
     file_id, size, duration, filename = info
     if size and size > MAX_UPLOAD_BYTES:
-        raise ValueError("Video 20 MB dan katta. Telegram bot orqali bunday faylni olish imkoni yo‘q; kichikroq video yuboring.")
+        raise ValueError("Video 20 MB dan katta. Telegram cloud Bot API getFile cheklovi sabab kichikroq video yuboring.")
     if duration and duration > MAX_SECONDS:
         raise ValueError("Video 10 daqiqadan uzun. Qisqaroq video yuboring.")
     tg_file = await bot.get_file(file_id)
     await bot.download_file(tg_file.file_path, destination=target)
     return target, duration
+
 
 async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
@@ -124,8 +202,8 @@ async def run_ffmpeg(args: list[str]):
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
 
+
 async def make_round(src: Path, dst: Path):
-    # Telegram video note kvadrat bo‘lishi va 60 soniyadan oshmasligi kerak.
     await run_ffmpeg([
         "-i", str(src),
         "-t", "60",
@@ -135,8 +213,8 @@ async def make_round(src: Path, dst: Path):
         "-movflags", "+faststart", str(dst)
     ])
 
+
 async def make_916(src: Path, dst: Path):
-    # 9:16 portret: kadr markazidan crop qilinadi, qora chetlar qo‘shilmaydi.
     await run_ffmpeg([
         "-i", str(src),
         "-vf", "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1",
@@ -144,6 +222,7 @@ async def make_916(src: Path, dst: Path):
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(dst)
     ])
+
 
 async def process_uploaded_video(message: Message, mode: str):
     status = await message.answer("⏳ Video tayyorlanmoqda...")
@@ -170,16 +249,19 @@ async def process_uploaded_video(message: Message, mode: str):
     finally:
         user_modes.pop(message.from_user.id, None)
 
+
 def valid_video_url(raw: str) -> bool:
     try:
         parsed = urlparse(raw.strip())
         host = (parsed.hostname or "").lower()
-        return parsed.scheme == "https" and (host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS))
+        return parsed.scheme == "https" and (
+            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
+        )
     except Exception:
         return False
 
+
 async def download_public_link(url: str, folder: Path) -> Path:
-    # yt-dlp public, ruxsat etilgan kontent uchungina ishlatiladi.
     try:
         import yt_dlp
     except ImportError:
@@ -197,9 +279,11 @@ async def download_public_link(url: str, folder: Path) -> Path:
         "no_warnings": True,
         "merge_output_format": "mp4",
     }
+
     def do_download():
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
+
     await asyncio.to_thread(do_download)
     files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
     if not files:
@@ -208,6 +292,7 @@ async def download_public_link(url: str, folder: Path) -> Path:
     if result.stat().st_size > MAX_LINK_BYTES:
         raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
     return result
+
 
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -224,7 +309,7 @@ async def handle_text(message: Message):
                 video_path = await download_public_link(text, Path(tmp))
                 await message.answer_video(FSInputFile(video_path), caption="✅ Video tayyor!")
             await status.delete()
-        except Exception as exc:
+        except Exception:
             log.exception("Link download failed")
             await status.edit_text(
                 "❌ Videoni olib bo‘lmadi.\n"
@@ -244,6 +329,7 @@ async def handle_text(message: Message):
     else:
         await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
+
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
     mode = user_modes.get(message.from_user.id)
@@ -255,9 +341,11 @@ async def handle_video(message: Message):
         return
     await process_uploaded_video(message, mode)
 
+
 @router.message()
 async def fallback(message: Message):
     await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+
 
 async def on_startup():
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
@@ -269,9 +357,11 @@ async def on_startup():
     )
     log.info("Webhook set: %s", webhook_url)
 
+
 async def on_shutdown():
     await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
+
 
 async def main():
     app = web.Application(client_max_size=2 * 1024 * 1024)
@@ -290,8 +380,8 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("ASAVED listening on port %s", PORT)
-    # Render Web Service processini faol ushlab turish.
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
