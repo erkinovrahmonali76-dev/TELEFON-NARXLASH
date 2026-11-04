@@ -116,7 +116,8 @@ MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
 # Admin Telegram ID raqamlari: Render Environment -> ADMIN_IDS=123456789,987654321
-ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+_admin_ids_raw = os.getenv("ADMIN_IDS", "") or os.getenv("ADMIN_ID", "")
+ADMIN_IDS = {int(x.strip()) for x in _admin_ids_raw.replace(";", ",").split(",") if x.strip().isdigit()}
 ADMIN_BROADCAST_BTN = "📢 Reklamani hammaga yuborish"
 
 
@@ -247,6 +248,10 @@ class SubscriptionMiddleware(BaseMiddleware):
 
         register_user(event.from_user.id)
 
+        # Telegram ID ni tekshirish uchun /myid buyrug'i obunasiz ham ishlaydi.
+        if event.text and event.text.split()[0].split("@")[0] == "/myid":
+            return await handler(event, data)
+
         # Admin bot funksiyalaridan obunasiz ham foydalana oladi.
         if event.from_user.id in ADMIN_IDS:
             return await handler(event, data)
@@ -276,7 +281,7 @@ async def check_subscription_callback(callback: CallbackQuery):
         if callback.message:
             # Yangi obuna bo'lgan foydalanuvchiga ham reklama bir marta yuboriladi.
             await send_ad_once(callback.message.chat.id, callback.from_user.id)
-            await callback.message.answer(main_text(), reply_markup=keyboard)
+            await callback.message.answer(main_text(), reply_markup=admin_reply_keyboard() if callback.from_user.id in ADMIN_IDS else keyboard)
     else:
         await callback.answer(
             "❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!",
@@ -288,6 +293,15 @@ def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     rows = [list(row) for row in keyboard.keyboard]
     rows.append([KeyboardButton(text=ADMIN_BROADCAST_BTN)])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+@router.message(Command("myid"))
+async def show_my_id(message: Message):
+    if message.from_user:
+        await message.answer(
+            f"🆔 Sizning Telegram ID raqamingiz: <code>{message.from_user.id}</code>\n\n"
+            "Shu raqamni Render → Environment → ADMIN_IDS qiymatiga kiriting."
+        )
 
 
 @router.message(Command("admin"))
@@ -411,7 +425,7 @@ async def choose_tts_male(message: Message):
     user_modes[message.from_user.id] = "tts_male"
     await message.answer(
         "👨 Erkak ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.",
-        reply_markup=keyboard
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
     )
 
 
@@ -420,14 +434,14 @@ async def choose_tts_female(message: Message):
     user_modes[message.from_user.id] = "tts_female"
     await message.answer(
         "👩 Ayol ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.",
-        reply_markup=keyboard
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
     )
 
 
 @router.message(F.text == "⬅️ Asosiy menyu")
 async def back_to_menu(message: Message):
     user_modes.pop(message.from_user.id, None)
-    await message.answer(main_text(), reply_markup=keyboard)
+    await message.answer(main_text(), reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
 
 
 async def text_to_speech(text: str, voice_id: str, destination: Path):
@@ -684,7 +698,7 @@ async def handle_text(message: Message):
     if valid_video_url(text):
         await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
     else:
-        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
 
 
 @router.message(F.video | F.document)
@@ -701,7 +715,7 @@ async def handle_video(message: Message):
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
 
 
 async def on_startup():
