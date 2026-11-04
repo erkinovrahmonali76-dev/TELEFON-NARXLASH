@@ -3,3 +3,4 @@ aiohttp
 yt-dlp
 qrcode[pil]
 Pillow
+edge-tts
