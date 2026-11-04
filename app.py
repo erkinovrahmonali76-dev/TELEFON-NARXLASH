@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import html
+import io
 import logging
 import os
 import re
@@ -58,6 +60,9 @@ BTN_ROUND = "🎥 Dumaloq video"
 BTN_LINK = "🔗 Video havolasi"
 BTN_916 = "📱 9:16 format"
 BTN_TTS = "🎙️ Matnni ovozga aylantirish"
+BTN_AI_IMAGE = "🖼️ AI rasm yaratish"
+BTN_AI_VIDEO = "🎬 AI video yaratish"
+BTN_IMAGE_VIDEO = "✨ Rasmni videoga aylantirish"
 BTN_BACK = "⬅️ Asosiy menyu"
 
 keyboard = ReplyKeyboardMarkup(
@@ -65,6 +70,8 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
         [KeyboardButton(text=BTN_LINK)],
         [KeyboardButton(text=BTN_TTS)],
+        [KeyboardButton(text=BTN_AI_IMAGE), KeyboardButton(text=BTN_AI_VIDEO)],
+        [KeyboardButton(text=BTN_IMAGE_VIDEO)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
@@ -86,6 +93,12 @@ SUBSCRIPTION_CACHE_SECONDS = 30
 VIDEO_SEMAPHORE = asyncio.Semaphore(2)
 TTS_SEMAPHORE = asyncio.Semaphore(2)
 MAX_TTS_CHARS = 3000
+AI_MEDIA_SEMAPHORE = asyncio.Semaphore(1)
+MAX_AI_PROMPT_CHARS = 1500
+MAX_AI_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_AI_OUTPUT_BYTES = 49 * 1024 * 1024
+# Image-to-video uchun foydalanuvchi yuborgan rasm vaqtincha xotirada turadi.
+pending_ai_images: dict[int, tuple[bytes, str]] = {}
 
 # ---------------------------------------------------------------------
 # ELEVENLABS AI VOICES
@@ -250,7 +263,10 @@ def main_text() -> str:
         "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
         "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
         "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
-        "🎙️ <b>Matnni ovozga aylantirish</b> — AI ovoz tanlab, matnni MP3 qiling.\n\n"
+        "🎙️ <b>Matnni ovozga aylantirish</b> — AI ovoz tanlab, matnni MP3 qiling.\n"
+        "🖼️ <b>AI rasm yaratish</b> — matndan rasm yarating.\n"
+        "🎬 <b>AI video yaratish</b> — matndan qisqa video yarating.\n"
+        "✨ <b>Rasmni videoga aylantirish</b> — rasm yuborib, uni jonlantiring.\n\n"
         "Faqat o'zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
 
@@ -323,6 +339,7 @@ async def check_subscription_callback(callback: CallbackQuery):
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
+    pending_ai_images.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
 
 
@@ -421,6 +438,7 @@ async def select_ai_voice(callback: CallbackQuery):
 @router.message(F.text == BTN_BACK)
 async def back_to_menu(message: Message):
     user_modes.pop(message.from_user.id, None)
+    pending_ai_images.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
 
 
@@ -516,6 +534,222 @@ async def process_tts(message: Message, text: str, mode: str):
         )
     finally:
         user_modes.pop(message.from_user.id, None)
+
+
+# ---------------------------------------------------------------------
+# ELEVENLABS IMAGE & VIDEO GENERATION
+# ---------------------------------------------------------------------
+ELEVENLABS_FLOWS_URL = "https://api.elevenlabs.io/v1/flows"
+AI_IMAGE_MODEL = os.getenv("ELEVENLABS_IMAGE_MODEL", "gemini-3-pro-image").strip()
+AI_VIDEO_MODEL = os.getenv(
+    "ELEVENLABS_VIDEO_MODEL", "veo-3.1-fast-generate-001"
+).strip()
+
+
+def require_elevenlabs_key():
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY kiritilmagan.")
+
+
+async def elevenlabs_json_request(method: str, url: str, payload: dict | None = None) -> dict:
+    require_elevenlabs_key()
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Accept": "application/json"}
+    timeout = ClientTimeout(total=90, connect=20)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.request(method, url, headers=headers, json=payload) as response:
+            if response.status not in (200, 201):
+                detail = (await response.text())[:900]
+                log.error("ElevenLabs %s %s: %s %s", method, url, response.status, detail)
+                if response.status == 401:
+                    raise RuntimeError("API kaliti noto'g'ri yoki faol emas (401).")
+                if response.status == 402:
+                    raise RuntimeError(
+                        "Image & Video API uchun Pro yoki undan yuqori tarif va yetarli kredit kerak (402)."
+                    )
+                if response.status == 403:
+                    raise RuntimeError(
+                        "API kalitida Image & Video yoki Flows ruxsati yoqilmagan (403)."
+                    )
+                if response.status == 422:
+                    raise RuntimeError("Model parametrlari mos kelmadi (422). Model va formatni tekshiring.")
+                if response.status == 429:
+                    raise RuntimeError("ElevenLabs so'rov limiti vaqtincha tugagan (429). Keyinroq urinib ko'ring.")
+                raise RuntimeError(f"ElevenLabs API xatosi: HTTP {response.status}. {detail[:250]}")
+            return await response.json()
+
+
+async def download_generation_result(content_url: str, destination: Path):
+    timeout = ClientTimeout(total=180, connect=20)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.get(content_url) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Tayyor faylni yuklab bo'lmadi: HTTP {response.status}")
+            data = await response.read()
+    if not data:
+        raise RuntimeError("AI bo'sh fayl qaytardi.")
+    if len(data) > MAX_AI_OUTPUT_BYTES:
+        raise RuntimeError("AI yaratgan fayl Telegram yuborish chegarasidan katta.")
+    destination.write_bytes(data)
+
+
+async def wait_for_generation(kind: str, generation_id: str, status_message: Message) -> dict:
+    """Image: 2s oralig'ida, video: 10s oralig'ida statusni tekshiradi."""
+    interval = 2 if kind == "image" else 10
+    max_wait = 150 if kind == "image" else 420
+    endpoint = f"{ELEVENLABS_FLOWS_URL}/{kind}/{generation_id}"
+    started = time.monotonic()
+    last_text = ""
+    while time.monotonic() - started < max_wait:
+        await asyncio.sleep(interval)
+        result = await elevenlabs_json_request("GET", endpoint)
+        state = str(result.get("status", "")).lower()
+        if state == "completed":
+            return result
+        if state == "failed":
+            reason = result.get("failure_reason", "unknown")
+            detail = result.get("error_message", "Generatsiya yakunlanmadi.")
+            raise RuntimeError(f"Generatsiya bajarilmadi ({reason}): {detail}")
+        elapsed = int(time.monotonic() - started)
+        new_text = f"⏳ AI {'rasm' if kind == 'image' else 'video'} tayyorlayapti... {elapsed} soniya"
+        if new_text != last_text:
+            try:
+                await status_message.edit_text(new_text)
+            except Exception:
+                pass
+            last_text = new_text
+    raise TimeoutError("Generatsiya ko'p vaqt oldi. Birozdan keyin qayta urinib ko'ring.")
+
+
+async def create_ai_image(prompt: str, message: Message):
+    if not prompt.strip() or len(prompt) > MAX_AI_PROMPT_CHARS:
+        raise ValueError(f"Matn 1–{MAX_AI_PROMPT_CHARS} belgi oralig'ida bo'lishi kerak.")
+    payload = {
+        "model_id": AI_IMAGE_MODEL,
+        "prompt": prompt,
+        "aspect_ratio": "9:16",
+        "resolution": "1K",
+    }
+    created = await elevenlabs_json_request("POST", f"{ELEVENLABS_FLOWS_URL}/image", payload)
+    result = await wait_for_generation("image", created["id"], message)
+    return result["content_url"]
+
+
+async def create_ai_video(prompt: str, message: Message, start_frame: dict | None = None):
+    if not prompt.strip() or len(prompt) > MAX_AI_PROMPT_CHARS:
+        raise ValueError(f"Matn 1–{MAX_AI_PROMPT_CHARS} belgi oralig'ida bo'lishi kerak.")
+    payload = {
+        "model_id": AI_VIDEO_MODEL,
+        "prompt": prompt,
+        "duration_secs": 8,
+        "aspect_ratio": "9:16",
+        "resolution": "720p",
+        "generate_audio": True,
+    }
+    if start_frame:
+        payload["start_frame"] = start_frame
+    created = await elevenlabs_json_request("POST", f"{ELEVENLABS_FLOWS_URL}/video", payload)
+    result = await wait_for_generation("video", created["id"], message)
+    return result["content_url"]
+
+
+async def deliver_ai_image(message: Message, prompt: str):
+    status = await message.answer("🖼️ AI rasm yaratish boshlandi...")
+    try:
+        async with AI_MEDIA_SEMAPHORE:
+            content_url = await create_ai_image(prompt, status)
+            with tempfile.TemporaryDirectory(prefix="asaved_ai_image_") as tmp:
+                path = Path(tmp) / "asaved_ai.png"
+                await download_generation_result(content_url, path)
+                await message.answer_photo(FSInputFile(path), caption="✅ AI rasm tayyor!")
+        await status.delete()
+    except Exception as exc:
+        log.exception("AI image generation failed")
+        await status.edit_text(f"❌ Rasm yaratishda xatolik: {html.escape(str(exc)[:600])}")
+    finally:
+        user_modes.pop(message.from_user.id, None)
+
+
+async def deliver_ai_video(message: Message, prompt: str, start_frame: dict | None = None):
+    status = await message.answer("🎬 AI video yaratish boshlandi. Bu bir necha daqiqa olishi mumkin...")
+    try:
+        async with AI_MEDIA_SEMAPHORE:
+            content_url = await create_ai_video(prompt, status, start_frame)
+            with tempfile.TemporaryDirectory(prefix="asaved_ai_video_") as tmp:
+                path = Path(tmp) / "asaved_ai.mp4"
+                await download_generation_result(content_url, path)
+                await message.answer_video(
+                    FSInputFile(path),
+                    caption="✅ AI video tayyor! (9:16, 8 soniya)"
+                )
+        await status.delete()
+    except Exception as exc:
+        log.exception("AI video generation failed")
+        await status.edit_text(f"❌ Video yaratishda xatolik: {html.escape(str(exc)[:600])}")
+    finally:
+        user_modes.pop(message.from_user.id, None)
+        pending_ai_images.pop(message.from_user.id, None)
+
+
+@router.message(F.text == BTN_AI_IMAGE)
+async def choose_ai_image(message: Message):
+    user_modes[message.from_user.id] = "ai_image"
+    pending_ai_images.pop(message.from_user.id, None)
+    await message.answer(
+        "🖼️ Qanday rasm kerakligini yozing. Masalan:\n"
+        "<i>Oq sport mashinasi, tun, yomg'irli Toshkent ko'chasi, cinematic, 9:16</i>\n\n"
+        "Bekor qilish: ⬅️ Asosiy menyu"
+    )
+
+
+@router.message(F.text == BTN_AI_VIDEO)
+async def choose_ai_video(message: Message):
+    user_modes[message.from_user.id] = "ai_video"
+    pending_ai_images.pop(message.from_user.id, None)
+    await message.answer(
+        "🎬 Qanday video kerakligini yozing. AI 9:16 formatda 8 soniyagacha video yaratadi.\n"
+        "Masalan: <i>Kamera sekin yaqinlashadi, yomg'irli ko'cha, cinematic, realistik.</i>"
+    )
+
+
+@router.message(F.text == BTN_IMAGE_VIDEO)
+async def choose_image_video(message: Message):
+    user_modes[message.from_user.id] = "ai_i2v_image"
+    pending_ai_images.pop(message.from_user.id, None)
+    await message.answer("✨ Endi jonlantirmoqchi bo'lgan rasmingizni yuboring (JPG, PNG yoki WEBP).")
+
+
+@router.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
+async def receive_ai_image(message: Message):
+    uid = message.from_user.id
+    mode = user_modes.get(uid)
+    if mode != "ai_i2v_image":
+        return
+
+    try:
+        if message.photo:
+            file_id = message.photo[-1].file_id
+            mime_type = "image/jpeg"
+        elif message.document:
+            file_id = message.document.file_id
+            mime_type = message.document.mime_type or "image/jpeg"
+        else:
+            return
+        tg_file = await bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await bot.download_file(tg_file.file_path, destination=buffer)
+        image_bytes = buffer.getvalue()
+        if not image_bytes:
+            raise ValueError("Rasm fayli bo'sh.")
+        if mime_type not in {"image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"}:
+            raise ValueError("Faqat JPG, PNG, WEBP, HEIC yoki HEIF rasmlarini yuboring.")
+        if len(image_bytes) > MAX_AI_IMAGE_BYTES:
+            raise ValueError("Rasm 20 MB dan katta. Kichikroq rasm yuboring.")
+        pending_ai_images[uid] = (image_bytes, mime_type)
+        user_modes[uid] = "ai_i2v_prompt"
+        await message.answer("✅ Rasm olindi! Endi unda qanday harakat bo'lishini yozing. Masalan: <i>Kamera yaqinlashsin, shamol sochlarni yengil harakatlantirsin.</i>")
+    except Exception as exc:
+        log.exception("Image upload failed")
+        await message.answer(f"❌ Rasmni olishda xatolik: {html.escape(str(exc)[:300])}")
 
 
 # ---------------------------------------------------------------------
@@ -719,6 +953,29 @@ async def download_public_link(
 async def handle_text(message: Message):
     text = (message.text or "").strip()
     mode = user_modes.get(message.from_user.id)
+
+    if mode == "ai_image":
+        await deliver_ai_image(message, text)
+        return
+
+    if mode == "ai_video":
+        await deliver_ai_video(message, text)
+        return
+
+    if mode == "ai_i2v_prompt":
+        image_data = pending_ai_images.get(message.from_user.id)
+        if not image_data:
+            user_modes[message.from_user.id] = "ai_i2v_image"
+            await message.answer("Avval rasm yuboring.")
+            return
+        raw_image, mime_type = image_data
+        start_frame = {
+            "type": "inline_base64",
+            "content_base64": base64.b64encode(raw_image).decode("ascii"),
+            "mime_type": mime_type,
+        }
+        await deliver_ai_video(message, text, start_frame)
+        return
 
     if mode and mode.startswith("tts:"):
         await process_tts(message, text, mode)
