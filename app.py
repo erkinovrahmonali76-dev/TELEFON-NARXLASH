@@ -5,6 +5,9 @@ import re
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
+import html
+
+import edge_tts
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web
@@ -47,11 +50,15 @@ dp.include_router(router)
 BTN_ROUND = "🎥 Dumaloq video"
 BTN_LINK = "🔗 Video havolasi"
 BTN_916 = "📱 9:16 format"
+BTN_TTS = "🎙️ Matnni ovozga aylantirish"
+BTN_MALE = "👨 Erkak ovozi"
+BTN_FEMALE = "👩 Ayol ovozi"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
         [KeyboardButton(text=BTN_LINK)],
+        [KeyboardButton(text=BTN_TTS)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
@@ -69,6 +76,9 @@ user_modes: dict[int, str] = {}
 subscription_cache: dict[int, float] = {}
 SUBSCRIPTION_CACHE_SECONDS = 30
 VIDEO_SEMAPHORE = asyncio.Semaphore(2)
+TTS_SEMAPHORE = asyncio.Semaphore(2)
+MAX_TTS_CHARS = 3000
+TTS_VOICES = {"male": "uz-UZ-SardorNeural", "female": "uz-UZ-MadinaNeural"}
 
 ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
@@ -81,14 +91,17 @@ MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
+
 def main_text() -> str:
     return (
         "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
         "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
         "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
-        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n\n"
+        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
+        "🎙️ <b>Matnni ovozga aylantirish</b> — matnni tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
         "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
+
 
 async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
     now = asyncio.get_running_loop().time()
@@ -111,12 +124,14 @@ async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
         log.exception("Kanal obunasini tekshirishda xatolik")
         return False
 
+
 async def send_subscription_required(message: Message):
     await message.answer(
         "⛔ Botdan foydalanish uchun avval kanalimizga obuna bo‘ling.\n"
         "Obuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.",
         reply_markup=subscribe_keyboard,
     )
+
 
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(
@@ -134,7 +149,9 @@ class SubscriptionMiddleware(BaseMiddleware):
         await send_subscription_required(event)
         return None
 
+
 router.message.middleware(SubscriptionMiddleware())
+
 
 @router.callback_query(F.data == "check_subscription")
 async def check_subscription_callback(callback: CallbackQuery):
@@ -152,25 +169,103 @@ async def check_subscription_callback(callback: CallbackQuery):
             show_alert=True,
         )
 
+
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
+
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
     user_modes[message.from_user.id] = "round"
     await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
 
+
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
     user_modes[message.from_user.id] = "916"
     await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
+
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
     user_modes[message.from_user.id] = "link"
     await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
+
+voice_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_MALE), KeyboardButton(text=BTN_FEMALE)],
+        [KeyboardButton(text="⬅️ Asosiy menyu")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Ovoz turini tanlang"
+)
+
+
+@router.message(F.text == BTN_TTS)
+async def choose_tts(message: Message):
+    user_modes[message.from_user.id] = "voice_choose"
+    await message.answer(
+        "🎙️ Qaysi ovozda matnni MP3 qilamiz?\n\n"
+        "Bu tayyor AI ovozlari; hech kimning shaxsiy ovozi klonlanmaydi.",
+        reply_markup=voice_keyboard
+    )
+
+
+@router.message(F.text == BTN_MALE)
+async def choose_tts_male(message: Message):
+    user_modes[message.from_user.id] = "tts_male"
+    await message.answer("👨 Erkak ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.", reply_markup=keyboard)
+
+
+@router.message(F.text == BTN_FEMALE)
+async def choose_tts_female(message: Message):
+    user_modes[message.from_user.id] = "tts_female"
+    await message.answer("👩 Ayol ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.", reply_markup=keyboard)
+
+
+@router.message(F.text == "⬅️ Asosiy menyu")
+async def back_to_menu(message: Message):
+    user_modes.pop(message.from_user.id, None)
+    await message.answer(main_text(), reply_markup=keyboard)
+
+
+async def text_to_speech(text: str, voice: str, destination: Path):
+    communicate = edge_tts.Communicate(text=text, voice=voice, rate="+0%", volume="+0%", pitch="+0%")
+    await communicate.save(str(destination))
+
+
+async def process_tts(message: Message, text: str, mode: str):
+    if len(text) > MAX_TTS_CHARS:
+        await message.answer(f"Matn juda uzun. Eng ko‘pi {MAX_TTS_CHARS} ta belgi yuboring.")
+        return
+    if not text.strip():
+        await message.answer("Ovozga aylantirish uchun matn yuboring.")
+        return
+    voice_key = "male" if mode == "tts_male" else "female"
+    voice = TTS_VOICES[voice_key]
+    status = await message.answer("🎙️ Matn ovozga aylantirilmoqda...")
+    try:
+        async with TTS_SEMAPHORE:
+            with tempfile.TemporaryDirectory(prefix="asaved_tts_") as tmp:
+                audio_path = Path(tmp) / "asaved_voice.mp3"
+                await text_to_speech(text, voice, audio_path)
+                if not audio_path.exists() or audio_path.stat().st_size == 0:
+                    raise RuntimeError("Audio fayl yaratilmadi")
+                await message.answer_audio(
+                    FSInputFile(audio_path),
+                    title="ASAVED AI ovoz",
+                    caption=f"✅ Tayyor! {'Erkak' if voice_key == 'male' else 'Ayol'} AI ovozi"
+                )
+        await status.delete()
+    except Exception:
+        log.exception("TTS generation failed")
+        await status.edit_text("❌ Ovoz yaratishda xatolik bo‘ldi. Birozdan keyin qayta urinib ko‘ring.")
+    finally:
+        user_modes.pop(message.from_user.id, None)
+
 
 def get_video_info(message: Message):
     if message.video:
@@ -178,6 +273,7 @@ def get_video_info(message: Message):
     if message.document and (message.document.mime_type or "").startswith("video/"):
         return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
     return None
+
 
 async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
     info = get_video_info(message)
@@ -192,6 +288,7 @@ async def download_telegram_video(message: Message, target: Path) -> tuple[Path,
     await bot.download_file(tg_file.file_path, destination=target)
     return target, duration
 
+
 async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
@@ -200,6 +297,7 @@ async def run_ffmpeg(args: list[str]):
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
+
 
 async def make_round(src: Path, dst: Path):
     await run_ffmpeg([
@@ -211,6 +309,7 @@ async def make_round(src: Path, dst: Path):
         "-movflags", "+faststart", str(dst)
     ])
 
+
 async def make_916(src: Path, dst: Path):
     await run_ffmpeg([
         "-i", str(src),
@@ -219,6 +318,7 @@ async def make_916(src: Path, dst: Path):
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(dst)
     ])
+
 
 async def process_uploaded_video(message: Message, mode: str):
     status = await message.answer("⚡ Video tezkor rejimda tayyorlanmoqda...")
@@ -242,9 +342,10 @@ async def process_uploaded_video(message: Message, mode: str):
         await status.delete()
     except Exception as exc:
         log.exception("Video processing failed")
-        await status.edit_text(f"❌ Xatolik: {str(exc)[:700]}")
+        await status.edit_text(f"❌ Xatolik: {html.escape(str(exc)[:700])}")
     finally:
         user_modes.pop(message.from_user.id, None)
+
 
 def valid_video_url(raw: str) -> bool:
     try:
@@ -256,6 +357,7 @@ def valid_video_url(raw: str) -> bool:
     except Exception:
         return False
 
+
 def detect_platform(url: str) -> tuple[str, str]:
     host = (urlparse(url).hostname or "").lower()
     if "instagram.com" in host:
@@ -263,6 +365,7 @@ def detect_platform(url: str) -> tuple[str, str]:
     if "tiktok.com" in host:
         return "tiktok", "TikTok"
     return "youtube", "YouTube"
+
 
 async def download_public_link(url: str, folder: Path, platform: str | None = None) -> Path:
     try:
@@ -310,10 +413,19 @@ async def download_public_link(url: str, folder: Path, platform: str | None = No
         raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
     return result
 
+
 @router.message(F.text)
 async def handle_text(message: Message):
     text = (message.text or "").strip()
     mode = user_modes.get(message.from_user.id)
+
+    if mode in ("tts_male", "tts_female"):
+        await process_tts(message, text, mode)
+        return
+
+    if mode == "voice_choose":
+        await message.answer("Avval 👨 Erkak ovozi yoki 👩 Ayol ovozini tanlang.", reply_markup=voice_keyboard)
+        return
 
     if mode == "link":
         if not valid_video_url(text):
@@ -350,6 +462,7 @@ async def handle_text(message: Message):
     else:
         await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
+
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
     mode = user_modes.get(message.from_user.id)
@@ -361,9 +474,11 @@ async def handle_video(message: Message):
         return
     await process_uploaded_video(message, mode)
 
+
 @router.message()
 async def fallback(message: Message):
     await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
+
 
 async def on_startup():
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
@@ -375,9 +490,11 @@ async def on_startup():
     )
     log.info("Webhook set: %s", webhook_url)
 
+
 async def on_shutdown():
     await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
+
 
 async def main():
     app = web.Application(client_max_size=2 * 1024 * 1024)
@@ -397,6 +514,7 @@ async def main():
     await site.start()
     log.info("ASAVED listening on port %s", PORT)
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
