@@ -14,7 +14,7 @@ from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
     Video, Document, ReplyKeyboardRemove, FSInputFile,
@@ -40,12 +40,16 @@ DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
 
 # Har bir foydalanuvchiga bir marta yuboriladigan reklama xabari.
 AD_TEXT = (
-    "📢 <b>Telegram kanalingizni reklama qilmoqchimisiz?</b>\n\n"
-    "Unda biz bilan bog‘laning!\n\n"
-    "Biz sizning Telegram kanalingizni ASAVED botimiz orqali "
-    "foydalanuvchilarga reklama qilib beramiz.\n\n"
-    "💬 Murojaat uchun: @akramovx7\n"
-    "🔗 https://t.me/akramovx7"
+    "🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\n"
+    "Telegram kanalingiz rivojlanishini, yangi obunachilar e’tiboriga tushishini "
+    "xohlaysizmi? Unda ASAVED orqali reklama imkoniyatidan foydalaning!\n\n"
+    "📣 <b>Biz nima taklif qilamiz?</b>\n"
+    "• Telegram kanalingizni ASAVED bot foydalanuvchilariga tanitish\n"
+    "• Loyihangiz haqida ko‘proq insonlarga ma’lumot yetkazish\n"
+    "• Reklama bo‘yicha siz bilan kelishilgan holda ishlash\n\n"
+    "✨ <b>Reklama joylashtirish uchun hoziroq bog‘laning!</b>\n\n"
+    "👤 Admin: @akramovx7\n"
+    '💬 <a href="https://t.me/akramovx7">Murojaat qilish</a>'
 )
 
 if not BOT_TOKEN:
@@ -111,6 +115,10 @@ MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
+# Admin Telegram ID raqamlari: Render Environment -> ADMIN_IDS=123456789,987654321
+ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+ADMIN_BROADCAST_BTN = "📢 Reklamani hammaga yuborish"
+
 
 def init_user_db():
     """Reklama yuborilgan Telegram foydalanuvchilarini SQLite'da saqlaydi."""
@@ -124,7 +132,34 @@ def init_user_db():
                 sent_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Avvalgi versiyada reklama olgan foydalanuvchilarni ham umumiy ro‘yxatga qo‘shamiz.
+        conn.execute("""
+            INSERT OR IGNORE INTO bot_users (user_id)
+            SELECT user_id FROM ad_sent_users
+        """)
         conn.commit()
+
+
+def register_user(user_id: int):
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("""
+            INSERT INTO bot_users (user_id) VALUES (?)
+            ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP
+        """, (user_id,))
+        conn.commit()
+
+
+def get_all_user_ids() -> list[int]:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute("SELECT user_id FROM bot_users").fetchall()
+    return [int(row[0]) for row in rows]
 
 
 def mark_ad_sent_once(user_id: int) -> bool:
@@ -210,6 +245,12 @@ class SubscriptionMiddleware(BaseMiddleware):
         if not event.from_user:
             return await handler(event, data)
 
+        register_user(event.from_user.id)
+
+        # Admin bot funksiyalaridan obunasiz ham foydalana oladi.
+        if event.from_user.id in ADMIN_IDS:
+            return await handler(event, data)
+
         if await is_subscribed(event.from_user.id):
             # Obunasi bor foydalanuvchiga reklama faqat bir marta yuboriladi.
             await send_ad_once(event.chat.id, event.from_user.id)
@@ -228,7 +269,9 @@ async def check_subscription_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
-    if await is_subscribed(callback.from_user.id, use_cache=False):
+    register_user(callback.from_user.id)
+
+    if callback.from_user.id in ADMIN_IDS or await is_subscribed(callback.from_user.id, use_cache=False):
         await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
         if callback.message:
             # Yangi obuna bo'lgan foydalanuvchiga ham reklama bir marta yuboriladi.
@@ -241,10 +284,88 @@ async def check_subscription_callback(callback: CallbackQuery):
         )
 
 
+def admin_reply_keyboard() -> ReplyKeyboardMarkup:
+    rows = [list(row) for row in keyboard.keyboard]
+    rows.append([KeyboardButton(text=ADMIN_BROADCAST_BTN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Sizda admin huquqi yo‘q.")
+        return
+    await message.answer(
+        "🛠 <b>Admin panel</b>\\n\\n"
+        f"👥 Bazadagi foydalanuvchilar: <b>{len(get_all_user_ids())}</b>\\n"
+        "Reklamani hammaga yuborish uchun quyidagi tugmani bosing.",
+        reply_markup=admin_reply_keyboard()
+    )
+
+
+@router.message(F.text == ADMIN_BROADCAST_BTN)
+async def admin_broadcast_start(message: Message):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        return
+    total = len(get_all_user_ids())
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, hammaga yuborish", callback_data="admin_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_broadcast_cancel")],
+    ])
+    await message.answer(
+        f"📢 Reklama <b>{total}</b> ta saqlangan foydalanuvchiga yuboriladi.\\n"
+        "Har bir bosishda reklama yana qayta yuboriladi. Davom etasizmi?",
+        reply_markup=confirm_kb
+    )
+
+
+@router.callback_query(F.data == "admin_broadcast_cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+    await callback.answer("Bekor qilindi.")
+    if callback.message:
+        await callback.message.edit_text("❌ Reklama yuborish bekor qilindi.")
+
+
+@router.callback_query(F.data == "admin_broadcast_confirm")
+async def admin_broadcast_confirm(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
+        return
+
+    await callback.answer("Yuborish boshlandi.")
+    if callback.message:
+        await callback.message.edit_text("⏳ Reklama foydalanuvchilarga yuborilmoqda...")
+
+    user_ids = get_all_user_ids()
+    sent = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, AD_TEXT, disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            log.info("Broadcast yuborilmadi user_id=%s: %s", user_id, exc)
+        await asyncio.sleep(0.05)
+
+    report = (
+        "✅ <b>Reklama yuborish yakunlandi!</b>\\n\\n"
+        f"👥 Jami ro‘yxatda: <b>{len(user_ids)}</b>\\n"
+        f"✅ Muvaffaqiyatli: <b>{sent}</b>\\n"
+        f"❌ Yuborilmadi: <b>{failed}</b>"
+    )
+    if callback.message:
+        await callback.message.answer(report, reply_markup=admin_reply_keyboard())
+
+
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
-    await message.answer(main_text(), reply_markup=keyboard)
+    reply_markup = admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
+    await message.answer(main_text(), reply_markup=reply_markup)
 
 
 @router.message(F.text == BTN_ROUND)
