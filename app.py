@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 import tempfile
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,6 +34,19 @@ BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 CHANNEL_USERNAME = "@ReklamaBozoriUzz"
 CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
+
+# SQLite bazasi. Render Persistent Disk ishlatilsa DB_PATH=/var/data/asaved_users.db qiling.
+DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
+
+# Har bir foydalanuvchiga bir marta yuboriladigan reklama xabari.
+AD_TEXT = (
+    "📢 <b>Telegram kanalingizni reklama qilmoqchimisiz?</b>\n\n"
+    "Unda biz bilan bog‘laning!\n\n"
+    "Biz sizning Telegram kanalingizni ASAVED botimiz orqali "
+    "foydalanuvchilarga reklama qilib beramiz.\n\n"
+    "💬 Murojaat uchun: @akramovx7\n"
+    "🔗 https://t.me/akramovx7"
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
@@ -77,13 +91,13 @@ SUBSCRIPTION_CACHE_SECONDS = 30
 VIDEO_SEMAPHORE = asyncio.Semaphore(2)
 TTS_SEMAPHORE = asyncio.Semaphore(2)
 MAX_TTS_CHARS = 3000
-# ElevenLabs tayyor (premade) ovozlari. Xohlasangiz Render Environment'da
-# ELEVENLABS_MALE_VOICE_ID va ELEVENLABS_FEMALE_VOICE_ID bilan almashtirasiz.
+
+# ElevenLabs tayyor (premade) ovozlari.
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 TTS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
 TTS_VOICES = {
-    "male": os.getenv("ELEVENLABS_MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip(),  # Adam
-    "female": os.getenv("ELEVENLABS_FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip(),  # Rachel
+    "male": os.getenv("ELEVENLABS_MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip(),
+    "female": os.getenv("ELEVENLABS_FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip(),
 }
 
 ALLOWED_HOSTS = {
@@ -97,6 +111,54 @@ MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
+
+def init_user_db():
+    """Reklama yuborilgan Telegram foydalanuvchilarini SQLite'da saqlaydi."""
+    db_file = Path(DB_PATH)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ad_sent_users (
+                user_id INTEGER PRIMARY KEY,
+                sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+def mark_ad_sent_once(user_id: int) -> bool:
+    """
+    Foydalanuvchi uchun reklama yuborilganini belgilaydi.
+    True — birinchi marta, False — avval yuborilgan.
+    """
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO ad_sent_users (user_id) VALUES (?)",
+            (user_id,)
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
+async def send_ad_once(chat_id: int, user_id: int):
+    """Har bir foydalanuvchiga reklama xabarini faqat bir marta yuboradi."""
+    try:
+        if not mark_ad_sent_once(user_id):
+            return
+
+        await bot.send_message(chat_id, AD_TEXT, disable_web_page_preview=True)
+        log.info("Reklama xabari yuborildi: user_id=%s", user_id)
+
+    except Exception:
+        # Xabar yuborilmasa, keyingi murojaatida qayta urinib ko'rish uchun
+        # bazadagi belgi olib tashlanadi.
+        log.exception("Reklama xabarini yuborishda xatolik: user_id=%s", user_id)
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.execute("DELETE FROM ad_sent_users WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+
 def main_text() -> str:
     return (
         "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
@@ -106,6 +168,7 @@ def main_text() -> str:
         "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
         "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
+
 
 async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
     now = asyncio.get_running_loop().time()
@@ -128,12 +191,14 @@ async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
         log.exception("Kanal obunasini tekshirishda xatolik")
         return False
 
+
 async def send_subscription_required(message: Message):
     await message.answer(
         "⛔ Botdan foydalanish uchun avval kanalimizga obuna bo‘ling.\n"
         "Obuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.",
         reply_markup=subscribe_keyboard,
     )
+
 
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(
@@ -146,12 +211,16 @@ class SubscriptionMiddleware(BaseMiddleware):
             return await handler(event, data)
 
         if await is_subscribed(event.from_user.id):
+            # Obunasi bor foydalanuvchiga reklama faqat bir marta yuboriladi.
+            await send_ad_once(event.chat.id, event.from_user.id)
             return await handler(event, data)
 
         await send_subscription_required(event)
         return None
 
+
 router.message.middleware(SubscriptionMiddleware())
+
 
 @router.callback_query(F.data == "check_subscription")
 async def check_subscription_callback(callback: CallbackQuery):
@@ -162,6 +231,8 @@ async def check_subscription_callback(callback: CallbackQuery):
     if await is_subscribed(callback.from_user.id, use_cache=False):
         await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
         if callback.message:
+            # Yangi obuna bo'lgan foydalanuvchiga ham reklama bir marta yuboriladi.
+            await send_ad_once(callback.message.chat.id, callback.from_user.id)
             await callback.message.answer(main_text(), reply_markup=keyboard)
     else:
         await callback.answer(
@@ -169,25 +240,30 @@ async def check_subscription_callback(callback: CallbackQuery):
             show_alert=True,
         )
 
+
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
+
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
     user_modes[message.from_user.id] = "round"
     await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
 
+
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
     user_modes[message.from_user.id] = "916"
     await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
+
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
     user_modes[message.from_user.id] = "link"
     await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
 
 voice_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -198,6 +274,7 @@ voice_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Ovoz turini tanlang"
 )
 
+
 @router.message(F.text == BTN_TTS)
 async def choose_tts(message: Message):
     user_modes[message.from_user.id] = "voice_choose"
@@ -207,26 +284,33 @@ async def choose_tts(message: Message):
         reply_markup=voice_keyboard
     )
 
+
 @router.message(F.text == BTN_MALE)
 async def choose_tts_male(message: Message):
     user_modes[message.from_user.id] = "tts_male"
-    await message.answer("👨 Erkak ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.", reply_markup=keyboard)
+    await message.answer(
+        "👨 Erkak ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.",
+        reply_markup=keyboard
+    )
+
 
 @router.message(F.text == BTN_FEMALE)
 async def choose_tts_female(message: Message):
     user_modes[message.from_user.id] = "tts_female"
-    await message.answer("👩 Ayol ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.", reply_markup=keyboard)
+    await message.answer(
+        "👩 Ayol ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.",
+        reply_markup=keyboard
+    )
+
 
 @router.message(F.text == "⬅️ Asosiy menyu")
 async def back_to_menu(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
 
-async def text_to_speech(text: str, voice_id: str, destination: Path):
-    """ElevenLabs'ning tayyor ovozida matnni MP3 ga aylantiradi.
 
-    Bu funksiya voice-cloning ishlatmaydi va ovoz namunasini qabul qilmaydi.
-    """
+async def text_to_speech(text: str, voice_id: str, destination: Path):
+    """ElevenLabs'ning tayyor ovozida matnni MP3 ga aylantiradi."""
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY topilmadi")
 
@@ -261,6 +345,7 @@ async def text_to_speech(text: str, voice_id: str, destination: Path):
         raise RuntimeError("ElevenLabs bo‘sh audio qaytardi")
     destination.write_bytes(audio_data)
 
+
 async def process_tts(message: Message, text: str, mode: str):
     if len(text) > MAX_TTS_CHARS:
         await message.answer(f"Matn juda uzun. Eng ko‘pi {MAX_TTS_CHARS} ta belgi yuboring.")
@@ -290,12 +375,14 @@ async def process_tts(message: Message, text: str, mode: str):
     finally:
         user_modes.pop(message.from_user.id, None)
 
+
 def get_video_info(message: Message):
     if message.video:
         return message.video.file_id, message.video.file_size, message.video.duration, "video.mp4"
     if message.document and (message.document.mime_type or "").startswith("video/"):
         return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
     return None
+
 
 async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
     info = get_video_info(message)
@@ -310,6 +397,7 @@ async def download_telegram_video(message: Message, target: Path) -> tuple[Path,
     await bot.download_file(tg_file.file_path, destination=target)
     return target, duration
 
+
 async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
@@ -318,6 +406,7 @@ async def run_ffmpeg(args: list[str]):
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
+
 
 async def make_round(src: Path, dst: Path):
     await run_ffmpeg([
@@ -329,6 +418,7 @@ async def make_round(src: Path, dst: Path):
         "-movflags", "+faststart", str(dst)
     ])
 
+
 async def make_916(src: Path, dst: Path):
     await run_ffmpeg([
         "-i", str(src),
@@ -337,6 +427,7 @@ async def make_916(src: Path, dst: Path):
         "-c:a", "aac", "-b:a", "128k",
         "-movflags", "+faststart", str(dst)
     ])
+
 
 async def process_uploaded_video(message: Message, mode: str):
     status = await message.answer("⚡ Video tezkor rejimda tayyorlanmoqda...")
@@ -364,6 +455,7 @@ async def process_uploaded_video(message: Message, mode: str):
     finally:
         user_modes.pop(message.from_user.id, None)
 
+
 def valid_video_url(raw: str) -> bool:
     try:
         parsed = urlparse(raw.strip())
@@ -374,6 +466,7 @@ def valid_video_url(raw: str) -> bool:
     except Exception:
         return False
 
+
 def detect_platform(url: str) -> tuple[str, str]:
     host = (urlparse(url).hostname or "").lower()
     if "instagram.com" in host:
@@ -381,6 +474,7 @@ def detect_platform(url: str) -> tuple[str, str]:
     if "tiktok.com" in host:
         return "tiktok", "TikTok"
     return "youtube", "YouTube"
+
 
 async def download_public_link(url: str, folder: Path, platform: str | None = None) -> Path:
     try:
@@ -390,12 +484,7 @@ async def download_public_link(url: str, folder: Path, platform: str | None = No
 
     platform = platform or detect_platform(url)[0]
     output_template = str(folder / "link_video.%(ext)s")
-    # Har bir platformada manbadagi kadr nisbati va o‘lcham saqlanadi:
-    # YouTube 16:9 bo‘lsa 16:9, Instagram/TikTok vertikal bo‘lsa vertikal qoladi.
-    # Faqat MP4 konteyneriga joylanadi; video qayta kesilmaydi yoki o‘lchami almashtirilmaydi.
     options = {
-        # Eng yaxshi sifatdagi video va audioni oladi; 1080p cheklovi yo‘q.
-        # Kadr o‘lchami, tomonlar nisbati va sifat qayta o‘zgartirilmaydi.
         "format": "bestvideo+bestaudio/best",
         "format_sort": ["res", "quality", "fps"],
         "outtmpl": output_template,
@@ -409,7 +498,6 @@ async def download_public_link(url: str, folder: Path, platform: str | None = No
         "buffersize": 1024 * 1024,
         "quiet": True,
         "no_warnings": True,
-        # Video oqimini qayta kodlamasdan MP4 konteyneriga joylaydi.
         "merge_output_format": "mp4",
         "remuxvideo": "mp4",
     }
@@ -427,6 +515,7 @@ async def download_public_link(url: str, folder: Path, platform: str | None = No
     if result.stat().st_size > MAX_LINK_BYTES:
         raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
     return result
+
 
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -476,6 +565,7 @@ async def handle_text(message: Message):
     else:
         await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
+
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
     mode = user_modes.get(message.from_user.id)
@@ -487,11 +577,14 @@ async def handle_video(message: Message):
         return
     await process_uploaded_video(message, mode)
 
+
 @router.message()
 async def fallback(message: Message):
     await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
+
 async def on_startup():
+    init_user_db()
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
@@ -501,11 +594,16 @@ async def on_startup():
     )
     log.info("Webhook set: %s", webhook_url)
 
+
 async def on_shutdown():
     await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
 
+
 async def main():
+    # Bazani webhook ishga tushishidan oldin ham tayyorlaymiz.
+    init_user_db()
+
     app = web.Application(client_max_size=2 * 1024 * 1024)
     app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
     app.router.add_get("/health", lambda request: web.Response(text="ok"))
@@ -523,6 +621,7 @@ async def main():
     await site.start()
     log.info("ASAVED listening on port %s", PORT)
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
