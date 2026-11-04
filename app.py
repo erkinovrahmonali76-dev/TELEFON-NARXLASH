@@ -7,10 +7,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 import html
 
-import edge_tts
 from typing import Any, Awaitable, Callable
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
@@ -78,7 +77,14 @@ SUBSCRIPTION_CACHE_SECONDS = 30
 VIDEO_SEMAPHORE = asyncio.Semaphore(2)
 TTS_SEMAPHORE = asyncio.Semaphore(2)
 MAX_TTS_CHARS = 3000
-TTS_VOICES = {"male": "uz-UZ-SardorNeural", "female": "uz-UZ-MadinaNeural"}
+# ElevenLabs tayyor (premade) ovozlari. Xohlasangiz Render Environment'da
+# ELEVENLABS_MALE_VOICE_ID va ELEVENLABS_FEMALE_VOICE_ID bilan almashtirasiz.
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+TTS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+TTS_VOICES = {
+    "male": os.getenv("ELEVENLABS_MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip(),  # Adam
+    "female": os.getenv("ELEVENLABS_FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip(),  # Rachel
+}
 
 ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
@@ -98,7 +104,7 @@ def main_text() -> str:
         "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
         "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
         "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
-        "🎙️ <b>Matnni ovozga aylantirish</b> — matnni tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
+        "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
         "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
 
@@ -208,8 +214,8 @@ voice_keyboard = ReplyKeyboardMarkup(
 async def choose_tts(message: Message):
     user_modes[message.from_user.id] = "voice_choose"
     await message.answer(
-        "🎙️ Qaysi ovozda matnni MP3 qilamiz?\n\n"
-        "Bu tayyor AI ovozlari; hech kimning shaxsiy ovozi klonlanmaydi.",
+        "🎙️ Qaysi ElevenLabs ovozida matnni MP3 qilamiz?\n\n"
+        "Bu tayyor AI ovozlari; ovoz namunasi yoki voice-cloning ishlatilmaydi.",
         reply_markup=voice_keyboard
     )
 
@@ -232,9 +238,44 @@ async def back_to_menu(message: Message):
     await message.answer(main_text(), reply_markup=keyboard)
 
 
-async def text_to_speech(text: str, voice: str, destination: Path):
-    communicate = edge_tts.Communicate(text=text, voice=voice, rate="+0%", volume="+0%", pitch="+0%")
-    await communicate.save(str(destination))
+async def text_to_speech(text: str, voice_id: str, destination: Path):
+    """ElevenLabs'ning tayyor ovozida matnni MP3 ga aylantiradi.
+
+    Bu funksiya voice-cloning ishlatmaydi va ovoz namunasini qabul qilmaydi.
+    """
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY topilmadi")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": TTS_MODEL_ID,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+        },
+    }
+    timeout = ClientTimeout(total=120, connect=20)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            if response.status != 200:
+                detail = (await response.text())[:500]
+                log.error("ElevenLabs API xatosi: status=%s, body=%s", response.status, detail)
+                if response.status == 401:
+                    raise RuntimeError("ElevenLabs API kaliti noto‘g‘ri yoki faol emas")
+                if response.status == 429:
+                    raise RuntimeError("ElevenLabs limiti yoki kreditlari tugagan bo‘lishi mumkin")
+                raise RuntimeError(f"ElevenLabs API xatosi ({response.status})")
+            audio_data = await response.read()
+
+    if not audio_data:
+        raise RuntimeError("ElevenLabs bo‘sh audio qaytardi")
+    destination.write_bytes(audio_data)
 
 
 async def process_tts(message: Message, text: str, mode: str):
