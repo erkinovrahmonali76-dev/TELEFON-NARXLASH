@@ -1,31 +1,30 @@
 import asyncio
-import html
 import logging
 import os
 import re
 import tempfile
-import time
 from pathlib import Path
 from urllib.parse import urlparse
+import html
+
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web, ClientSession, ClientTimeout
-from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import CommandStart
 from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile,
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    Video, Document, ReplyKeyboardRemove, FSInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
+from aiogram import BaseMiddleware
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("asaved")
 
-# ---------------------------------------------------------------------
-# ENVIRONMENT
-# ---------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
@@ -38,27 +37,21 @@ CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
 if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
-    raise RuntimeError(
-        "WEBHOOK_SECRET kamida 16 ta belgi bo'lsin; faqat harf, raqam, _ yoki - ishlating"
-    )
+    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin; faqat harf, raqam, _ yoki - ishlating")
 if not BASE_URL:
-    raise RuntimeError(
-        "RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring"
-    )
+    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring")
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-# ---------------------------------------------------------------------
-# MAIN MENU
-# ---------------------------------------------------------------------
 BTN_ROUND = "🎥 Dumaloq video"
 BTN_LINK = "🔗 Video havolasi"
 BTN_916 = "📱 9:16 format"
 BTN_TTS = "🎙️ Matnni ovozga aylantirish"
-BTN_BACK = "⬅️ Asosiy menyu"
+BTN_MALE = "👨 Erkak ovozi"
+BTN_FEMALE = "👩 Ayol ovozi"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -72,177 +65,37 @@ keyboard = ReplyKeyboardMarkup(
 
 subscribe_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=CHANNEL_URL)],
         [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")],
     ]
 )
 
-# ---------------------------------------------------------------------
-# USER STATE / LIMITS
-# ---------------------------------------------------------------------
+# Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
 user_modes: dict[int, str] = {}
 subscription_cache: dict[int, float] = {}
 SUBSCRIPTION_CACHE_SECONDS = 30
 VIDEO_SEMAPHORE = asyncio.Semaphore(2)
 TTS_SEMAPHORE = asyncio.Semaphore(2)
 MAX_TTS_CHARS = 3000
-
-# ---------------------------------------------------------------------
-# ELEVENLABS AI VOICES
-# Bot foydalanuvchiga ElevenLabs hisobida mavjud bo'lgan ovozlarni ko'rsatadi.
-# Har bir tugma o'z voice_id sini ishlatadi; barcha ovozlar bir xil emas.
-# ---------------------------------------------------------------------
+# ElevenLabs tayyor (premade) ovozlari. Xohlasangiz Render Environment'da
+# ELEVENLABS_MALE_VOICE_ID va ELEVENLABS_FEMALE_VOICE_ID bilan almashtirasiz.
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-TTS_MODEL_ID = os.getenv(
-    "ELEVENLABS_MODEL_ID", "eleven_multilingual_v2"
-).strip()
+TTS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+TTS_VOICES = {
+    "male": os.getenv("ELEVENLABS_MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip(),  # Adam
+    "female": os.getenv("ELEVENLABS_FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip(),  # Rachel
+}
 
-AI_VOICES_CACHE: list[dict[str, str]] = []
-AI_VOICES_CACHE_TIME = 0.0
-AI_VOICES_CACHE_TTL = 300  # 5 daqiqa
-VOICES_PER_PAGE = 30
-
-
-def voice_gender(voice: dict) -> str:
-    labels = voice.get("labels") or {}
-    gender = str(labels.get("gender", "")).strip().lower()
-    if gender in ("female", "woman"):
-        return "female"
-    if gender in ("male", "man"):
-        return "male"
-    return "other"
-
-
-async def load_ai_voices(force: bool = False) -> list[dict[str, str]]:
-    """ElevenLabs hisobida mavjud bo'lgan AI ovozlarni oladi va 5 daqiqa keshlaydi."""
-    global AI_VOICES_CACHE, AI_VOICES_CACHE_TIME
-
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError(
-            "Render Environment'da ELEVENLABS_API_KEY kiritilmagan."
-        )
-
-    now = time.monotonic()
-    if (
-        not force
-        and AI_VOICES_CACHE
-        and now - AI_VOICES_CACHE_TIME < AI_VOICES_CACHE_TTL
-    ):
-        return AI_VOICES_CACHE
-
-    url = "https://api.elevenlabs.io/v1/voices"
-    headers = {"xi-api-key": ELEVENLABS_API_KEY}
-    timeout = ClientTimeout(total=40, connect=15)
-
-    async with ClientSession(timeout=timeout) as session:
-        async with session.get(url, headers=headers) as response:
-            if response.status != 200:
-                detail = (await response.text())[:400]
-                log.error("ElevenLabs voices API: %s %s", response.status, detail)
-                if response.status == 401:
-                    raise RuntimeError("ElevenLabs API kaliti noto'g'ri yoki faol emas.")
-                if response.status == 429:
-                    raise RuntimeError("ElevenLabs so'rovlar limiti vaqtincha tugagan.")
-                raise RuntimeError(f"ElevenLabs ovozlar API xatosi: {response.status}")
-            data = await response.json()
-
-    voices = []
-    seen_ids = set()
-
-    for item in data.get("voices", []):
-        voice_id = str(item.get("voice_id") or "").strip()
-        name = str(item.get("name") or "Nomsiz AI ovoz").strip()
-
-        if not voice_id or voice_id in seen_ids:
-            continue
-        # Telegram callback_data uzunligi 64 baytdan oshmasin.
-        if len(("voice:" + voice_id).encode("utf-8")) > 64:
-            log.warning("Voice ID callback uchun juda uzun, o'tkazib yuborildi: %s", name)
-            continue
-
-        seen_ids.add(voice_id)
-        voices.append({
-            "id": voice_id,
-            "name": name[:45],
-            "gender": voice_gender(item),
-        })
-
-    if not voices:
-        raise RuntimeError(
-            "ElevenLabs hisobingizda foydalanish mumkin bo'lgan ovozlar topilmadi."
-        )
-
-    AI_VOICES_CACHE = voices
-    AI_VOICES_CACHE_TIME = time.monotonic()
-    return voices
-
-
-def make_voice_keyboard(
-    voices: list[dict[str, str]],
-    page: int = 0
-) -> InlineKeyboardMarkup:
-    start = page * VOICES_PER_PAGE
-    page_voices = voices[start:start + VOICES_PER_PAGE]
-    rows = []
-    row = []
-
-    for voice in page_voices:
-        if voice["gender"] == "female":
-            icon = "👩"
-        elif voice["gender"] == "male":
-            icon = "👨"
-        else:
-            icon = "🎙️"
-
-        label = f"{icon} {voice['name']}"
-        row.append(
-            InlineKeyboardButton(
-                text=label[:60],
-                callback_data=f"voice:{voice['id']}"
-            )
-        )
-        if len(row) == 2:
-            rows.append(row)
-            row = []
-
-    if row:
-        rows.append(row)
-
-    total_pages = max(1, (len(voices) + VOICES_PER_PAGE - 1) // VOICES_PER_PAGE)
-    nav = []
-    if page > 0:
-        nav.append(
-            InlineKeyboardButton(
-                text="⬅️ Oldingi",
-                callback_data=f"voicepage:{page - 1}"
-            )
-        )
-    if page + 1 < total_pages:
-        nav.append(
-            InlineKeyboardButton(
-                text="Keyingi ➡️",
-                callback_data=f"voicepage:{page + 1}"
-            )
-        )
-    if nav:
-        rows.append(nav)
-
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-# ---------------------------------------------------------------------
-# VIDEO LIMITS
-# ---------------------------------------------------------------------
 ALLOWED_HOSTS = {
     "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
     "instagram.com", "www.instagram.com",
     "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
 }
+
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
-
 
 def main_text() -> str:
     return (
@@ -250,10 +103,9 @@ def main_text() -> str:
         "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
         "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
         "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
-        "🎙️ <b>Matnni ovozga aylantirish</b> — AI ovoz tanlab, matnni MP3 qiling.\n\n"
-        "Faqat o'zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
+        "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
+        "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
-
 
 async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
     now = asyncio.get_running_loop().time()
@@ -276,14 +128,12 @@ async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
         log.exception("Kanal obunasini tekshirishda xatolik")
         return False
 
-
 async def send_subscription_required(message: Message):
     await message.answer(
-        "⛔ Botdan foydalanish uchun avval kanalimizga obuna bo'ling.\n"
-        "Obuna bo'lgach, «Obunani tekshirish» tugmasini bosing.",
+        "⛔ Botdan foydalanish uchun avval kanalimizga obuna bo‘ling.\n"
+        "Obuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.",
         reply_markup=subscribe_keyboard,
     )
-
 
 class SubscriptionMiddleware(BaseMiddleware):
     async def __call__(
@@ -294,138 +144,89 @@ class SubscriptionMiddleware(BaseMiddleware):
     ) -> Any:
         if not event.from_user:
             return await handler(event, data)
+
         if await is_subscribed(event.from_user.id):
             return await handler(event, data)
+
         await send_subscription_required(event)
         return None
 
-
 router.message.middleware(SubscriptionMiddleware())
-router.callback_query.middleware(SubscriptionMiddleware())
-
 
 @router.callback_query(F.data == "check_subscription")
 async def check_subscription_callback(callback: CallbackQuery):
     if not callback.from_user:
         await callback.answer()
         return
+
     if await is_subscribed(callback.from_user.id, use_cache=False):
         await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
         if callback.message:
             await callback.message.answer(main_text(), reply_markup=keyboard)
     else:
         await callback.answer(
-            "❌ Hali kanalga obuna bo'lmagansiz. Avval obuna bo'ling!",
+            "❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!",
             show_alert=True,
         )
-
 
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
 
-
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
     user_modes[message.from_user.id] = "round"
     await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
 
-
 @router.message(F.text == BTN_916)
 async def choose_916(message: Message):
     user_modes[message.from_user.id] = "916"
-    await message.answer("📱 Endi 9:16 formatga o'tkazish uchun videoni yuboring.")
-
+    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
 
 @router.message(F.text == BTN_LINK)
 async def choose_link(message: Message):
     user_modes[message.from_user.id] = "link"
     await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
 
+voice_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_MALE), KeyboardButton(text=BTN_FEMALE)],
+        [KeyboardButton(text="⬅️ Asosiy menyu")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Ovoz turini tanlang"
+)
 
-# ---------------------------------------------------------------------
-# TTS HANDLERS
-# ---------------------------------------------------------------------
 @router.message(F.text == BTN_TTS)
 async def choose_tts(message: Message):
-    status = await message.answer("🔎 ElevenLabs AI ovozlari yuklanmoqda...")
-    try:
-        voices = await load_ai_voices(force=True)
-        await status.delete()
-        total_pages = max(1, (len(voices) + VOICES_PER_PAGE - 1) // VOICES_PER_PAGE)
-        await message.answer(
-            f"🎙️ Hisobingizdan {len(voices)} ta AI ovoz topildi.\n"
-            f"1-sahifa / {total_pages}\n\n"
-            "👩 Qiz va 👨 o'g'il ovozlari alohida ko'rsatiladi. "
-            "O'zingizga yoqqan ismli ovozni tanlang.",
-            reply_markup=make_voice_keyboard(voices, 0)
-        )
-        user_modes[message.from_user.id] = "voice_choose"
-    except Exception as exc:
-        log.exception("AI ovozlar ro'yxatini olishda xatolik")
-        await status.edit_text(
-            f"❌ {html.escape(str(exc)[:500])}"
-        )
+    user_modes[message.from_user.id] = "voice_choose"
+    await message.answer(
+        "🎙️ Qaysi ElevenLabs ovozida matnni MP3 qilamiz?\n\n"
+        "Bu tayyor AI ovozlari; ovoz namunasi yoki voice-cloning ishlatilmaydi.",
+        reply_markup=voice_keyboard
+    )
 
+@router.message(F.text == BTN_MALE)
+async def choose_tts_male(message: Message):
+    user_modes[message.from_user.id] = "tts_male"
+    await message.answer("👨 Erkak ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.", reply_markup=keyboard)
 
-@router.callback_query(F.data.startswith("voicepage:"))
-async def change_voice_page(callback: CallbackQuery):
-    try:
-        page = int(callback.data.split(":", 1)[1])
-        voices = await load_ai_voices()
-        total_pages = max(1, (len(voices) + VOICES_PER_PAGE - 1) // VOICES_PER_PAGE)
+@router.message(F.text == BTN_FEMALE)
+async def choose_tts_female(message: Message):
+    user_modes[message.from_user.id] = "tts_female"
+    await message.answer("👩 Ayol ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.", reply_markup=keyboard)
 
-        if page < 0 or page >= total_pages:
-            await callback.answer("Bu sahifa mavjud emas.", show_alert=True)
-            return
-
-        if callback.message:
-            await callback.message.edit_reply_markup(
-                reply_markup=make_voice_keyboard(voices, page)
-            )
-        await callback.answer(f"{page + 1}-sahifa")
-    except Exception:
-        log.exception("Ovoz sahifasini almashtirish xatosi")
-        await callback.answer("Ovozlar ro'yxatini yangilab bo'lmadi.", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("voice:"))
-async def select_ai_voice(callback: CallbackQuery):
-    voice_id = callback.data.split(":", 1)[1]
-    try:
-        voices = await load_ai_voices()
-        selected = next((v for v in voices if v["id"] == voice_id), None)
-
-        if not selected:
-            await callback.answer(
-                "Bu ovoz endi mavjud emas. Ro'yxatni qayta oching.",
-                show_alert=True
-            )
-            return
-
-        user_modes[callback.from_user.id] = f"tts:{voice_id}"
-
-        if callback.message:
-            await callback.message.answer(
-                f"✅ <b>{html.escape(selected['name'])}</b> ovozi tanlandi.\n\n"
-                "Endi gapirtirmoqchi bo'lgan matningizni yuboring.",
-                reply_markup=keyboard
-            )
-        await callback.answer("Ovoz tanlandi!")
-    except Exception:
-        log.exception("AI ovoz tanlash xatosi")
-        await callback.answer("Ovoz tanlashda xatolik bo'ldi.", show_alert=True)
-
-
-@router.message(F.text == BTN_BACK)
+@router.message(F.text == "⬅️ Asosiy menyu")
 async def back_to_menu(message: Message):
     user_modes.pop(message.from_user.id, None)
     await message.answer(main_text(), reply_markup=keyboard)
 
-
 async def text_to_speech(text: str, voice_id: str, destination: Path):
-    """ElevenLabs tayyor AI ovozida matnni MP3 ga aylantiradi."""
+    """ElevenLabs'ning tayyor ovozida matnni MP3 ga aylantiradi.
+
+    Bu funksiya voice-cloning ishlatmaydi va ovoz namunasini qabul qilmaydi.
+    """
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY topilmadi")
 
@@ -444,154 +245,98 @@ async def text_to_speech(text: str, voice_id: str, destination: Path):
         },
     }
     timeout = ClientTimeout(total=120, connect=20)
-
     async with ClientSession(timeout=timeout) as session:
         async with session.post(url, headers=headers, json=payload) as response:
             if response.status != 200:
                 detail = (await response.text())[:500]
-                log.error(
-                    "ElevenLabs TTS xatosi: status=%s, body=%s",
-                    response.status, detail
-                )
+                log.error("ElevenLabs API xatosi: status=%s, body=%s", response.status, detail)
                 if response.status == 401:
-                    raise RuntimeError("ElevenLabs API kaliti noto'g'ri yoki faol emas.")
+                    raise RuntimeError("ElevenLabs API kaliti noto‘g‘ri yoki faol emas")
                 if response.status == 429:
-                    raise RuntimeError(
-                        "ElevenLabs limiti yoki kreditlari tugagan bo'lishi mumkin."
-                    )
-                if response.status == 422:
-                    raise RuntimeError(
-                        "Tanlangan ovoz yoki model bu matn uchun mos emas."
-                    )
+                    raise RuntimeError("ElevenLabs limiti yoki kreditlari tugagan bo‘lishi mumkin")
                 raise RuntimeError(f"ElevenLabs API xatosi ({response.status})")
-
             audio_data = await response.read()
 
     if not audio_data:
-        raise RuntimeError("ElevenLabs bo'sh audio qaytardi")
+        raise RuntimeError("ElevenLabs bo‘sh audio qaytardi")
     destination.write_bytes(audio_data)
-
 
 async def process_tts(message: Message, text: str, mode: str):
     if len(text) > MAX_TTS_CHARS:
-        await message.answer(
-            f"Matn juda uzun. Eng ko'pi {MAX_TTS_CHARS} ta belgi yuboring."
-        )
+        await message.answer(f"Matn juda uzun. Eng ko‘pi {MAX_TTS_CHARS} ta belgi yuboring.")
         return
     if not text.strip():
         await message.answer("Ovozga aylantirish uchun matn yuboring.")
         return
-
-    voice_id = mode.removeprefix("tts:")
-    valid_ids = {voice["id"] for voice in await load_ai_voices()}
-    if voice_id not in valid_ids:
-        user_modes.pop(message.from_user.id, None)
-        await message.answer(
-            "Tanlangan ovoz topilmadi. Iltimos, ovozni qaytadan tanlang.",
-            reply_markup=keyboard
-        )
-        return
-
-    status = await message.answer("🎙️ Tanlangan AI ovoz matningizni gapiryapti...")
+    voice_key = "male" if mode == "tts_male" else "female"
+    voice = TTS_VOICES[voice_key]
+    status = await message.answer("🎙️ Matn ovozga aylantirilmoqda...")
     try:
         async with TTS_SEMAPHORE:
             with tempfile.TemporaryDirectory(prefix="asaved_tts_") as tmp:
                 audio_path = Path(tmp) / "asaved_voice.mp3"
-                await text_to_speech(text, voice_id, audio_path)
-
+                await text_to_speech(text, voice, audio_path)
                 if not audio_path.exists() or audio_path.stat().st_size == 0:
                     raise RuntimeError("Audio fayl yaratilmadi")
-
                 await message.answer_audio(
                     FSInputFile(audio_path),
                     title="ASAVED AI ovoz",
-                    caption="✅ Tanlangan AI ovozda tayyor!"
+                    caption=f"✅ Tayyor! {'Erkak' if voice_key == 'male' else 'Ayol'} AI ovozi"
                 )
-
         await status.delete()
-    except Exception as exc:
+    except Exception:
         log.exception("TTS generation failed")
-        await status.edit_text(
-            f"❌ Ovoz yaratishda xatolik: {html.escape(str(exc)[:500])}"
-        )
+        await status.edit_text("❌ Ovoz yaratishda xatolik bo‘ldi. Birozdan keyin qayta urinib ko‘ring.")
     finally:
         user_modes.pop(message.from_user.id, None)
 
-
-# ---------------------------------------------------------------------
-# VIDEO PROCESSING
-# ---------------------------------------------------------------------
 def get_video_info(message: Message):
     if message.video:
-        return (
-            message.video.file_id,
-            message.video.file_size,
-            message.video.duration,
-            "video.mp4"
-        )
+        return message.video.file_id, message.video.file_size, message.video.duration, "video.mp4"
     if message.document and (message.document.mime_type or "").startswith("video/"):
-        return (
-            message.document.file_id,
-            message.document.file_size,
-            None,
-            message.document.file_name or "video.mp4"
-        )
+        return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
     return None
-
 
 async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
     info = get_video_info(message)
     if not info:
         raise ValueError("Video topilmadi. Iltimos, video fayl yuboring.")
-
     file_id, size, duration, filename = info
     if size and size > MAX_UPLOAD_BYTES:
-        raise ValueError(
-            "Video 20 MB dan katta. Telegram cloud Bot API cheklovi sabab kichikroq video yuboring."
-        )
+        raise ValueError("Video 20 MB dan katta. Telegram cloud Bot API getFile cheklovi sabab kichikroq video yuboring.")
     if duration and duration > MAX_SECONDS:
         raise ValueError("Video 10 daqiqadan uzun. Qisqaroq video yuboring.")
-
     tg_file = await bot.get_file(file_id)
     await bot.download_file(tg_file.file_path, destination=target)
     return target, duration
 
-
 async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(
-            stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi"
-        )
-
+        raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
 
 async def make_round(src: Path, dst: Path):
     await run_ffmpeg([
         "-i", str(src),
         "-t", "60",
-        "-vf",
-        "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
         "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27",
         "-c:a", "aac", "-b:a", "96k", "-ac", "2",
-        "-movflags", "+faststart", str(dst),
+        "-movflags", "+faststart", str(dst)
     ])
-
 
 async def make_916(src: Path, dst: Path):
     await run_ffmpeg([
         "-i", str(src),
-        "-vf",
-        "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
         "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "26",
         "-c:a", "aac", "-b:a", "128k",
-        "-movflags", "+faststart", str(dst),
+        "-movflags", "+faststart", str(dst)
     ])
-
 
 async def process_uploaded_video(message: Message, mode: str):
     status = await message.answer("⚡ Video tezkor rejimda tayyorlanmoqda...")
@@ -601,51 +346,33 @@ async def process_uploaded_video(message: Message, mode: str):
                 folder = Path(tmp)
                 src = folder / "input_video"
                 dst = folder / "output.mp4"
-
                 await download_telegram_video(message, src)
-
                 if mode == "round":
                     await make_round(src, dst)
                     if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                        raise ValueError(
-                            "Tayyor video juda katta chiqdi. Qisqaroq video yuboring."
-                        )
+                        raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
                     await message.answer_video_note(FSInputFile(dst))
                 else:
                     await make_916(src, dst)
                     if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                        raise ValueError(
-                            "Tayyor video 49 MB dan katta. Qisqaroq video yuboring."
-                        )
-                    await message.answer_video(
-                        FSInputFile(dst),
-                        caption="📱 9:16 format tayyor!"
-                    )
-
+                        raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
+                    await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
         await status.delete()
     except Exception as exc:
         log.exception("Video processing failed")
-        await status.edit_text(
-            f"❌ Xatolik: {html.escape(str(exc)[:700])}"
-        )
+        await status.edit_text(f"❌ Xatolik: {html.escape(str(exc)[:700])}")
     finally:
         user_modes.pop(message.from_user.id, None)
 
-
-# ---------------------------------------------------------------------
-# LINK DOWNLOADER
-# ---------------------------------------------------------------------
 def valid_video_url(raw: str) -> bool:
     try:
         parsed = urlparse(raw.strip())
         host = (parsed.hostname or "").lower()
         return parsed.scheme == "https" and (
-            host in ALLOWED_HOSTS
-            or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
+            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
         )
     except Exception:
         return False
-
 
 def detect_platform(url: str) -> tuple[str, str]:
     host = (urlparse(url).hostname or "").lower()
@@ -655,22 +382,20 @@ def detect_platform(url: str) -> tuple[str, str]:
         return "tiktok", "TikTok"
     return "youtube", "YouTube"
 
-
-async def download_public_link(
-    url: str,
-    folder: Path,
-    platform: str | None = None
-) -> Path:
+async def download_public_link(url: str, folder: Path, platform: str | None = None) -> Path:
     try:
         import yt_dlp
     except ImportError:
-        raise RuntimeError(
-            "yt-dlp o'rnatilmagan. requirements.txt faylini tekshiring."
-        )
+        raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
 
     platform = platform or detect_platform(url)[0]
     output_template = str(folder / "link_video.%(ext)s")
+    # Har bir platformada manbadagi kadr nisbati va o‘lcham saqlanadi:
+    # YouTube 16:9 bo‘lsa 16:9, Instagram/TikTok vertikal bo‘lsa vertikal qoladi.
+    # Faqat MP4 konteyneriga joylanadi; video qayta kesilmaydi yoki o‘lchami almashtirilmaydi.
     options = {
+        # Eng yaxshi sifatdagi video va audioni oladi; 1080p cheklovi yo‘q.
+        # Kadr o‘lchami, tomonlar nisbati va sifat qayta o‘zgartirilmaydi.
         "format": "bestvideo+bestaudio/best",
         "format_sort": ["res", "quality", "fps"],
         "outtmpl": output_template,
@@ -684,6 +409,7 @@ async def download_public_link(
         "buffersize": 1024 * 1024,
         "quiet": True,
         "no_warnings": True,
+        # Video oqimini qayta kodlamasdan MP4 konteyneriga joylaydi.
         "merge_output_format": "mp4",
         "remuxvideo": "mp4",
     }
@@ -694,59 +420,37 @@ async def download_public_link(
 
     log.info("Video yuklanmoqda: platforma=%s", platform)
     await asyncio.to_thread(do_download)
-
-    files = [
-        p for p in folder.iterdir()
-        if p.is_file() and p.name.startswith("link_video.")
-    ]
+    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
     if not files:
-        raise RuntimeError(
-            "Video topilmadi yoki platforma yuklashga ruxsat bermadi."
-        )
-
+        raise RuntimeError("Video topilmadi yoki platforma yuklashga ruxsat bermadi.")
     result = max(files, key=lambda p: p.stat().st_size)
     if result.stat().st_size > MAX_LINK_BYTES:
-        raise RuntimeError(
-            "Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring."
-        )
+        raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
     return result
 
-
-# ---------------------------------------------------------------------
-# TEXT / VIDEO ROUTERS
-# ---------------------------------------------------------------------
 @router.message(F.text)
 async def handle_text(message: Message):
     text = (message.text or "").strip()
     mode = user_modes.get(message.from_user.id)
 
-    if mode and mode.startswith("tts:"):
+    if mode in ("tts_male", "tts_female"):
         await process_tts(message, text, mode)
         return
 
     if mode == "voice_choose":
-        await message.answer(
-            "Avval ro'yxatdan AI ovozni tugma orqali tanlang."
-        )
+        await message.answer("Avval 👨 Erkak ovozi yoki 👩 Ayol ovozini tanlang.", reply_markup=voice_keyboard)
         return
 
     if mode == "link":
         if not valid_video_url(text):
-            await message.answer(
-                "❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring."
-            )
+            await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
             return
-
-        status = await message.answer(
-            "⚡ Video tezkor rejimda yuklanmoqda..."
-        )
+        status = await message.answer("⚡ Video tezkor rejimda yuklanmoqda... Odatda 1 daqiqada tayyor bo‘lishiga harakat qiladi.")
         try:
             platform, platform_title = detect_platform(text)
             async with VIDEO_SEMAPHORE:
                 with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
-                    video_path = await download_public_link(
-                        text, Path(tmp), platform
-                    )
+                    video_path = await download_public_link(text, Path(tmp), platform)
                     await message.answer_video(
                         FSInputFile(video_path),
                         caption=f"✅ {platform_title} videosi MP4 formatda tayyor!"
@@ -755,103 +459,70 @@ async def handle_text(message: Message):
         except Exception:
             log.exception("Link download failed")
             await status.edit_text(
-                "❌ Videoni olib bo'lmadi.\n"
-                "Sabab: havola yopiq bo'lishi, platforma cheklovi yoki video hajmi bo'lishi mumkin.\n"
-                "O'zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko'ring."
+                "❌ Videoni olib bo‘lmadi.\n"
+                "Sabab: havola yopiq bo‘lishi, platforma cheklovi yoki video hajmi bo‘lishi mumkin.\n"
+                "O‘zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko‘ring."
             )
         finally:
             user_modes.pop(message.from_user.id, None)
         return
 
     if mode in ("round", "916"):
-        await message.answer(
-            "Iltimos, havola emas, galereyadan video fayl yuboring."
-        )
+        await message.answer("Iltimos, havola emas, galereyadan video fayl yuboring.")
         return
 
     if valid_video_url(text):
-        await message.answer(
-            "Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring."
-        )
+        await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
     else:
-        await message.answer(
-            "Menyudan kerakli funksiyani tanlang.",
-            reply_markup=keyboard
-        )
-
+        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
     mode = user_modes.get(message.from_user.id)
-
     if mode not in ("round", "916"):
-        await message.answer(
-            "Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang."
-        )
+        await message.answer("Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang.")
         return
-
     if not get_video_info(message):
         await message.answer("Iltimos, video fayl yuboring.")
         return
-
     await process_uploaded_video(message, mode)
-
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer(
-        "Menyudan kerakli funksiyani tanlang.",
-        reply_markup=keyboard
-    )
+    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=keyboard)
 
-
-# ---------------------------------------------------------------------
-# WEBHOOK
-# ---------------------------------------------------------------------
 async def on_startup():
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
         secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True,
-        allowed_updates=dp.resolve_used_update_types(),
+        allowed_updates=dp.resolve_used_update_types()
     )
     log.info("Webhook set: %s", webhook_url)
-
 
 async def on_shutdown():
     await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
 
-
 async def main():
     app = web.Application(client_max_size=2 * 1024 * 1024)
-    app.router.add_get(
-        "/",
-        lambda request: web.Response(text="ASAVED bot is running")
-    )
-    app.router.add_get(
-        "/health",
-        lambda request: web.Response(text="ok")
-    )
-
+    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
+    app.router.add_get("/health", lambda request: web.Response(text="ok"))
     SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
-        secret_token=WEBHOOK_SECRET,
+        secret_token=WEBHOOK_SECRET
     ).register(app, path=f"/{WEBHOOK_PATH}")
-
     setup_application(app, dp, bot=bot)
     app.on_startup.append(lambda app: on_startup())
     app.on_cleanup.append(lambda app: on_shutdown())
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("ASAVED listening on port %s", PORT)
     await asyncio.Event().wait()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
