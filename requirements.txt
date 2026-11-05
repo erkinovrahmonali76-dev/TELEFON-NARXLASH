@@ -3,4 +3,3 @@ aiohttp
 yt-dlp
 qrcode[pil]
 Pillow
-gradio_client>=1.3.0
