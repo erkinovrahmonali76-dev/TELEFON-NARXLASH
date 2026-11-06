@@ -1,4 +1,7 @@
 import asyncio
+import contextlib
+import hashlib
+import io
 import html
 import logging
 import os
@@ -34,12 +37,8 @@ PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
 
-# Majburiy obuna kanali — faqat shu kanal tekshiriladi
 CHANNEL_USERNAME = "@ReklamaBozoriUzz"
 CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
-
-# Kino qidirish tugmasi alohida kino kanaliga olib boradi
-MOVIE_CHANNEL_URL = "https://t.me/kinoolamiuzzzz"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
@@ -71,6 +70,9 @@ BTN_BROADCAST = "📢 Reklamani hammaga yuborish"
 BTN_MALE = "👨 Erkak ovozi"
 BTN_FEMALE = "👩 Ayol ovozi"
 BTN_MENU = "⬅️ Asosiy menyu"
+BTN_PRO = "💎 PRO sotib olish"
+BTN_MP3 = "🎵 Havoladan MP3"
+BTN_PROLINK = "📚 PRO video navbati"
 
 user_modes: dict[int, str] = {}
 movie_uploads: dict[int, dict] = {}
@@ -114,6 +116,8 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_LINK)],
         [KeyboardButton(text=BTN_TTS)],
         [KeyboardButton(text=BTN_MY_VIDEOS)],
+        [KeyboardButton(text=BTN_PRO), KeyboardButton(text=BTN_MP3)],
+        [KeyboardButton(text=BTN_PROLINK)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
@@ -152,7 +156,8 @@ def main_text() -> str:
         "📱 9:16 format — videoni vertikal formatga o‘tkazing.\n"
         "🔗 Video havolasi — YouTube, Instagram yoki TikTok.\n"
         "🎙️ Matnni ovozga aylantirish — matnni MP3 qiling.\n"
-        "📁 Mening videolarim — oldin tayyorlangan fayllarni qayta oling."
+        "📁 Mening videolarim — oldin tayyorlangan fayllarni qayta oling.\n"
+        "💎 PRO — yuqori sifat, MP3 va bir nechta havolani navbat bilan yuklash."
     )
 
 # ------------------------- DATABASE -------------------------
@@ -202,7 +207,139 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_user ON saved_videos(user_id, id DESC)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS pro_subscriptions(
+            user_id INTEGER PRIMARY KEY,
+            expires_at INTEGER NOT NULL,
+            reminder_sent INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS pro_payments(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            plan TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            receipt_file_id TEXT NOT NULL,
+            receipt_hash TEXT UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            reviewed_at TEXT,
+            reviewed_by INTEGER
+        )""")
+        payment_columns = {row[1] for row in conn.execute("PRAGMA table_info(pro_payments)").fetchall()}
+        if "receipt_hash" not in payment_columns:
+            conn.execute("ALTER TABLE pro_payments ADD COLUMN receipt_hash TEXT")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_pro_receipt_hash ON pro_payments(receipt_hash) WHERE receipt_hash IS NOT NULL")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pro_payments_status ON pro_payments(status, id DESC)")
         conn.commit()
+
+PRO_PLANS = {
+    "week": {"title": "7 kunlik PRO", "days": 7, "amount": 20000},
+    "month": {"title": "30 kunlik PRO", "days": 30, "amount": 35000},
+}
+PRO_CARD = os.getenv("PRO_CARD", "").strip()
+PRO_CARDHOLDER = os.getenv("PRO_CARDHOLDER", "").strip()
+
+def get_pro_expiry(user_id: int) -> int:
+    with db() as conn:
+        row = conn.execute("SELECT expires_at FROM pro_subscriptions WHERE user_id=?", (user_id,)).fetchone()
+        return int(row[0]) if row else 0
+
+def is_pro(user_id: int) -> bool:
+    return get_pro_expiry(user_id) > int(__import__("time").time())
+
+def create_payment(user_id: int, plan: str, receipt_file_id: str, receipt_hash: str) -> int | None:
+    info = PRO_PLANS[plan]
+    with db() as conn:
+        try:
+            cur = conn.execute(
+                "INSERT INTO pro_payments(user_id,plan,amount,receipt_file_id,receipt_hash) VALUES(?,?,?,?,?)",
+                (user_id, plan, info["amount"], receipt_file_id, receipt_hash)
+            )
+        except sqlite3.IntegrityError:
+            return None
+        conn.commit()
+        return int(cur.lastrowid)
+
+def review_payment(payment_id: int, admin_id: int, approve: bool):
+    now = int(__import__("time").time())
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT user_id,plan,status FROM pro_payments WHERE id=?", (payment_id,)
+        ).fetchone()
+        if not row or row[2] != "pending":
+            conn.rollback()
+            return None
+        user_id, plan, _ = row
+        status = "approved" if approve else "rejected"
+        conn.execute(
+            "UPDATE pro_payments SET status=?, reviewed_at=CURRENT_TIMESTAMP, reviewed_by=? WHERE id=? AND status='pending'",
+            (status, admin_id, payment_id)
+        )
+        if approve:
+            days = PRO_PLANS[plan]["days"]
+            current = conn.execute(
+                "SELECT expires_at FROM pro_subscriptions WHERE user_id=?", (user_id,)
+            ).fetchone()
+            start = max(now, int(current[0]) if current else now)
+            expiry = start + days * 86400
+            conn.execute(
+                """INSERT INTO pro_subscriptions(user_id,expires_at,reminder_sent)
+                   VALUES(?,?,0)
+                   ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at,
+                   reminder_sent=0, updated_at=CURRENT_TIMESTAMP""",
+                (user_id, expiry)
+            )
+        else:
+            expiry = 0
+        conn.commit()
+        return {"user_id": int(user_id), "plan": plan, "expires_at": expiry}
+
+def active_pro_count() -> int:
+    with db() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM pro_subscriptions WHERE expires_at>?",
+                           (int(__import__("time").time()),)).fetchone()
+        return int(row[0] or 0)
+
+def approved_revenue() -> int:
+    with db() as conn:
+        row = conn.execute("SELECT COALESCE(SUM(amount),0) FROM pro_payments WHERE status='approved'").fetchone()
+        return int(row[0] or 0)
+
+def pro_user_rows(limit: int = 30):
+    with db() as conn:
+        return conn.execute(
+            "SELECT user_id,expires_at FROM pro_subscriptions WHERE expires_at>? ORDER BY expires_at DESC LIMIT ?",
+            (int(__import__("time").time()), limit)
+        ).fetchall()
+
+async def pro_reminder_loop():
+    while True:
+        try:
+            now = int(__import__("time").time())
+            with db() as conn:
+                rows = conn.execute(
+                    "SELECT user_id,expires_at FROM pro_subscriptions WHERE expires_at>? AND expires_at<=? AND reminder_sent=0",
+                    (now, now + 86400)
+                ).fetchall()
+                for user_id, expiry in rows:
+                    cur = conn.execute(
+                        "UPDATE pro_subscriptions SET reminder_sent=1 WHERE user_id=? AND reminder_sent=0",
+                        (user_id,)
+                    )
+                    if cur.rowcount:
+                        try:
+                            await bot.send_message(
+                                int(user_id),
+                                "⏰ <b>PRO obunangiz 24 soat ichida tugaydi.</b>\n"
+                                "Imkoniyatlardan foydalanishda davom etish uchun PRO obunani uzaytiring.",
+                            )
+                        except Exception:
+                            log.info("PRO eslatma yuborilmadi: %s", user_id)
+                conn.commit()
+        except Exception:
+            log.exception("PRO reminder loop xatosi")
+        await asyncio.sleep(1800)
 
 def register_user(user_id: int):
     with db() as conn:
@@ -310,7 +447,7 @@ async def send_movie(chat_id: int, movie: dict):
     if description:
         caption += "\n\n📝 " + description
     channel_button = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔎 Kino kodini qidirish", url=MOVIE_CHANNEL_URL)
+        InlineKeyboardButton(text="🔎 Kino kodini qidirish", url=CHANNEL_URL)
     ]])
     if movie.get("poster_file_id"):
         await bot.send_photo(chat_id, movie["poster_file_id"], caption=caption[:1024], protect_content=True)
@@ -357,7 +494,7 @@ class SubscriptionMiddleware(BaseMiddleware):
         if await is_subscribed(event.from_user.id):
             return await handler(event, data)
         await event.answer(
-            "⛔ ASAVED botidan foydalanish uchun avval @ReklamaBozoriUzz kanaliga obuna bo‘ling.",
+            "⛔ ASAVED botidan foydalanish uchun avval Kino Olami kanaliga obuna bo‘ling.",
             reply_markup=subscribe_keyboard
         )
         return None
@@ -384,6 +521,96 @@ async def myid(message: Message):
         "Render → Environment → ADMIN_IDS ga kiriting."
     )
 
+@router.message(F.text == BTN_PRO)
+async def pro_buy_menu(message: Message):
+    uid = message.from_user.id
+    expiry = get_pro_expiry(uid)
+    if expiry > int(__import__("time").time()):
+        from datetime import datetime
+        until = datetime.fromtimestamp(expiry).strftime("%d.%m.%Y %H:%M")
+        active = f"\n\n✅ Sizda PRO faol. Tugash vaqti: <b>{until}</b>"
+    else:
+        active = ""
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="7 kun — 20 000 so‘m", callback_data="proplan:week")],
+        [InlineKeyboardButton(text="30 kun — 35 000 so‘m", callback_data="proplan:month")],
+    ])
+    await message.answer(
+        "💎 <b>ASAVED PRO</b>\n\n"
+        "🎵 Havoladan MP3 olish\n"
+        "🎞 Video sifatini tanlash: 360p–1080p\n"
+        "📚 5 tagacha havolani navbat bilan yuklash\n"
+        f"{active}\n\nTarifni tanlang:",
+        reply_markup=kb
+    )
+
+@router.callback_query(F.data.startswith("proplan:"))
+async def pro_plan_callback(callback: CallbackQuery):
+    plan = callback.data.split(":", 1)[1]
+    if plan not in PRO_PLANS:
+        await callback.answer("Tarif topilmadi.", show_alert=True)
+        return
+    info = PRO_PLANS[plan]
+    user_modes[callback.from_user.id] = f"pro_receipt:{plan}"
+    await callback.answer()
+    if not PRO_CARD or not PRO_CARDHOLDER:
+        user_modes.pop(callback.from_user.id, None)
+        if callback.message:
+            await callback.message.answer("⚠️ To‘lov kartasi sozlanmagan. Admin Render Environment bo‘limida PRO_CARD va PRO_CARDHOLDER ni kiritsin.")
+        return
+    if callback.message:
+        await callback.message.answer(
+            f"💳 <b>To‘lov ma’lumotlari</b>\n\n"
+            f"Tarif: <b>{info['title']}</b>\n"
+            f"Summa: <b>{info['amount']:,} so‘m</b>\n"
+            f"Karta: <code>{PRO_CARD}</code>\n"
+            f"Karta egasi: <b>{PRO_CARDHOLDER}</b>\n\n"
+            "To‘lovni amalga oshirib, chek/skrinshotni shu chatga <b>rasm</b> qilib yuboring. "
+            "Admin tekshirganidan keyin PRO faollashadi.\n"
+            "Bekor qilish: /cancel"
+        )
+
+@router.callback_query(F.data.startswith("proreview:"))
+async def pro_review_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Faqat admin tasdiqlashi mumkin.", show_alert=True)
+        return
+    try:
+        _, action, raw_id = callback.data.split(":")
+        payment_id = int(raw_id)
+    except Exception:
+        await callback.answer("So‘rov noto‘g‘ri.", show_alert=True)
+        return
+    result = review_payment(payment_id, callback.from_user.id, action == "yes")
+    if not result:
+        await callback.answer("Bu to‘lov allaqachon ko‘rib chiqilgan.", show_alert=True)
+        return
+    uid = result["user_id"]
+    if action == "yes":
+        from datetime import datetime
+        until = datetime.fromtimestamp(result["expires_at"]).strftime("%d.%m.%Y %H:%M")
+        try:
+            await bot.send_message(uid, f"🎉 <b>PRO faollashtirildi!</b>\nAmal qilish muddati: <b>{until}</b>")
+        except Exception:
+            log.exception("PRO approval notification failed")
+        await callback.answer("PRO faollashtirildi.")
+        if callback.message:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + "\n\n✅ <b>TASDIQLANDI</b>",
+                reply_markup=None
+            )
+    else:
+        try:
+            await bot.send_message(uid, "❌ To‘lov cheki admin tomonidan tasdiqlanmadi. Iltimos, chek va summani tekshirib qayta yuboring.")
+        except Exception:
+            log.exception("PRO rejection notification failed")
+        await callback.answer("To‘lov rad etildi.")
+        if callback.message:
+            await callback.message.edit_caption(
+                caption=(callback.message.caption or "") + "\n\n❌ <b>RAD ETILDI</b>",
+                reply_markup=None
+            )
+
 @router.message(CommandStart())
 async def start(message: Message):
     user_modes.pop(message.from_user.id, None)
@@ -396,9 +623,40 @@ async def admin_panel(message: Message):
         return
     await message.answer(
         f"🛠 <b>Admin panel</b>\n👥 Foydalanuvchilar: {len(all_user_ids())}\n"
+        f"💎 Faol PRO: {active_pro_count()}\n"
+        f"💰 Tasdiqlangan tushum: {approved_revenue():,} so‘m\n"
+        "Batafsil: /prostats va /prousers\n"
         "Kino qo‘shish: ➕ Kino qo‘shish",
         reply_markup=admin_keyboard()
     )
+
+@router.message(Command("prostats"))
+async def pro_stats_command(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    with db() as conn:
+        pending = conn.execute("SELECT COUNT(*) FROM pro_payments WHERE status='pending'").fetchone()[0]
+        approved = conn.execute("SELECT COUNT(*) FROM pro_payments WHERE status='approved'").fetchone()[0]
+        rejected = conn.execute("SELECT COUNT(*) FROM pro_payments WHERE status='rejected'").fetchone()[0]
+    await message.answer(
+        f"💎 <b>PRO statistikasi</b>\nFaol obunalar: {active_pro_count()}\n"
+        f"⏳ Kutilayotgan cheklar: {pending}\n✅ Tasdiqlangan: {approved}\n"
+        f"❌ Rad etilgan: {rejected}\n💰 Jami tushum: {approved_revenue():,} so‘m"
+    )
+
+@router.message(Command("prousers"))
+async def pro_users_command(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    from datetime import datetime
+    rows = pro_user_rows()
+    if not rows:
+        await message.answer("Hozir faol PRO foydalanuvchilar yo‘q.")
+        return
+    lines = ["💎 <b>Faol PRO foydalanuvchilar</b>"]
+    for user_id, expiry in rows:
+        lines.append(f"• <code>{user_id}</code> — {datetime.fromtimestamp(expiry).strftime('%d.%m.%Y %H:%M')}")
+    await message.answer("\n".join(lines[:31]))
 
 # ------------------------- MOVIE MANAGEMENT -------------------------
 
@@ -415,6 +673,7 @@ async def add_movie_start(message: Message):
 @router.message(Command("cancel"))
 async def cancel_upload(message: Message):
     movie_uploads.pop(message.from_user.id, None)
+    user_modes.pop(message.from_user.id, None)
     await message.answer("❌ Amal bekor qilindi.", reply_markup=menu_for(message.from_user.id))
 
 @router.message(Command("delmovie"))
@@ -459,12 +718,62 @@ async def movie_callback(callback: CallbackQuery):
 @router.message(F.photo)
 async def movie_poster(message: Message):
     uid = message.from_user.id
-    upload = movie_uploads.get(uid)
-    if not upload or upload.get("step") != "poster":
+    mode = user_modes.get(uid, "")
+    if mode.startswith("pro_receipt:"):
+        plan = mode.split(":", 1)[1]
+        if plan not in PRO_PLANS:
+            user_modes.pop(uid, None)
+            await message.answer("Tarif topilmadi. PRO menyusidan qayta boshlang.")
+            return
+        receipt_id = message.photo[-1].file_id
+        try:
+            tg_file = await bot.get_file(receipt_id)
+            buffer = io.BytesIO()
+            await bot.download_file(tg_file.file_path, destination=buffer)
+            receipt_hash = hashlib.sha256(buffer.getvalue()).hexdigest()
+        except Exception:
+            log.exception("Receipt download/hash failed")
+            await message.answer("❌ Chek rasmini tekshirib bo‘lmadi. Iltimos, qayta yuboring.")
+            return
+        payment_id = create_payment(uid, plan, receipt_id, receipt_hash)
+        if payment_id is None:
+            user_modes.pop(uid, None)
+            await message.answer("⚠️ Bu chek avval yuborilgan. Bitta chek bilan qayta PRO olish mumkin emas.", reply_markup=menu_for(uid))
+            return
+        user_modes.pop(uid, None)
+        await message.answer("✅ Chek adminga yuborildi. Tekshiruvdan so‘ng javob olasiz.", reply_markup=menu_for(uid))
+        if not ADMIN_IDS:
+            await message.answer("⚠️ Admin ID sozlanmagan. Chek qabul qilindi, lekin admin ko‘ra olmaydi.")
+            return
+        user = message.from_user
+        name = html.escape(user.full_name or "Noma’lum")
+        username = f"@{html.escape(user.username)}" if user.username else "username yo‘q"
+        info = PRO_PLANS[plan]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"proreview:yes:{payment_id}"),
+            InlineKeyboardButton(text="❌ Rad etish", callback_data=f"proreview:no:{payment_id}")
+        ]])
+        caption = (
+            f"💎 <b>Yangi PRO to‘lovi</b>\n"
+            f"🧾 ID: <code>{payment_id}</code>\n"
+            f"👤 {name} ({username})\n"
+            f"🆔 <code>{uid}</code>\n"
+            f"📦 {info['title']}\n"
+            f"💰 {info['amount']:,} so‘m"
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_photo(admin_id, receipt_id, caption=caption, reply_markup=kb)
+            except Exception:
+                log.exception("PRO receipt admin delivery failed: %s", admin_id)
         return
-    upload["poster_file_id"] = message.photo[-1].file_id
-    upload["step"] = "video"
-    await message.answer("✅ Poster olindi. Endi kino videosini yoki video faylni yuboring.")
+    upload = movie_uploads.get(uid)
+    if upload and upload.get("step") == "poster":
+        upload["poster_file_id"] = message.photo[-1].file_id
+        upload["step"] = "video"
+        await message.answer("✅ Poster olindi. Endi kino videosini yoki video faylni yuboring.")
+        return
+    await message.answer("Rasm qabul qilindi. Agar PRO to‘lovi bo‘lsa, avval PRO tarifini tanlang.")
 
 # ------------------------- VIDEO HELPERS -------------------------
 
@@ -602,6 +911,59 @@ async def choose_tts(message: Message):
     user_modes[message.from_user.id] = "voice_choose"
     await message.answer("🎙️ Ovoz turini tanlang:", reply_markup=voice_keyboard)
 
+@router.message(F.text == BTN_MP3)
+async def choose_mp3(message: Message):
+    uid = message.from_user.id
+    if not is_pro(uid):
+        await message.answer("🔒 MP3 yuklash — PRO funksiyasi. 💎 PRO sotib olish tugmasini bosing.")
+        return
+    user_modes[uid] = "pro_mp3"
+    await message.answer("🎵 O‘zingiz yuklab olish huquqiga ega bo‘lgan YouTube, Instagram yoki TikTok havolasini yuboring.")
+
+@router.message(F.text == BTN_PROLINK)
+async def choose_pro_links(message: Message):
+    uid = message.from_user.id
+    if not is_pro(uid):
+        await message.answer("🔒 Bu funksiya PRO uchun. 💎 PRO sotib olish tugmasini bosing.")
+        return
+    user_modes[uid] = "pro_links"
+    await message.answer("📚 5 tagacha havolani yangi qatorlardan yuboring. Faqat o‘zingiz yuklab olish huquqiga ega kontent.")
+
+@router.callback_query(F.data.startswith("proquality:"))
+async def pro_quality_callback(callback: CallbackQuery):
+    uid = callback.from_user.id
+    if not is_pro(uid):
+        await callback.answer("PRO obuna faol emas.", show_alert=True)
+        return
+    mode = user_modes.get(uid, "")
+    if not mode.startswith("pro_quality:"):
+        await callback.answer("Havolalar topilmadi. Qayta yuboring.", show_alert=True)
+        return
+    try:
+        quality = int(callback.data.split(":", 1)[1])
+        if quality not in (360, 480, 720, 1080):
+            raise ValueError
+    except ValueError:
+        await callback.answer("Sifat noto‘g‘ri.", show_alert=True)
+        return
+    urls = mode.split(":", 1)[1].splitlines()
+    user_modes.pop(uid, None)
+    await callback.answer(f"{quality}p tanlandi")
+    if callback.message:
+        await callback.message.answer(f"⏳ {len(urls)} ta video navbat bilan yuklanmoqda...")
+    for idx, url in enumerate(urls, 1):
+        try:
+            with tempfile.TemporaryDirectory(prefix="asaved_pro_") as tmp:
+                async with VIDEO_SEMAPHORE:
+                    path = await download_public_link(url, Path(tmp), quality=quality)
+                    sent = await bot.send_video(uid, FSInputFile(path), caption=f"✅ {idx}/{len(urls)} — {quality}p")
+                    if sent.video:
+                        save_user_video(uid, sent.video.file_id, "video", f"PRO video {quality}p")
+        except Exception as exc:
+            log.exception("PRO batch video error")
+            await bot.send_message(uid, f"❌ {idx}-havola yuklanmadi: {html.escape(str(exc)[:200])}")
+    await bot.send_message(uid, "✅ Navbat yakunlandi. Fayllar «Mening videolarim» bo‘limiga saqlandi.")
+
 @router.message(F.text == BTN_MALE)
 async def choose_male(message: Message):
     user_modes[message.from_user.id] = "tts_male"
@@ -637,25 +999,19 @@ def detect_platform(url: str):
         return "TikTok"
     return "YouTube"
 
-async def download_public_link(url: str, folder: Path) -> Path:
+async def download_public_link(url: str, folder: Path, quality: int | None = None) -> Path:
     try:
         import yt_dlp
     except ImportError:
         raise RuntimeError("yt-dlp o‘rnatilmagan.")
+    fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]" if quality else "bestvideo+bestaudio/best"
     opts = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": str(folder / "link_video.%(ext)s"),
-        "noplaylist": True,
-        "max_filesize": MAX_LINK_BYTES,
-        "socket_timeout": 20,
-        "retries": 1,
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": "mp4",
-        "remuxvideo": "mp4",
+        "format": fmt, "outtmpl": str(folder / "link_video.%(ext)s"),
+        "noplaylist": True, "max_filesize": MAX_LINK_BYTES,
+        "socket_timeout": 20, "retries": 1, "quiet": True, "no_warnings": True,
+        "merge_output_format": "mp4", "remuxvideo": "mp4",
     }
     def work():
-        import yt_dlp
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
     await asyncio.to_thread(work)
@@ -665,6 +1021,29 @@ async def download_public_link(url: str, folder: Path) -> Path:
     result = max(files, key=lambda p: p.stat().st_size)
     if result.stat().st_size > MAX_LINK_BYTES:
         raise RuntimeError("Video 49 MB dan katta.")
+    return result
+
+async def download_public_audio(url: str, folder: Path) -> Path:
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("yt-dlp o‘rnatilmagan.")
+    opts = {
+        "format": "bestaudio/best", "outtmpl": str(folder / "link_audio.%(ext)s"),
+        "noplaylist": True, "max_filesize": MAX_LINK_BYTES,
+        "socket_timeout": 25, "retries": 1, "quiet": True, "no_warnings": True,
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+    }
+    def work():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    await asyncio.to_thread(work)
+    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_audio.") and p.suffix.lower() == ".mp3"]
+    if not files:
+        raise RuntimeError("MP3 tayyorlanmadi. FFmpeg o‘rnatilganini tekshiring.")
+    result = max(files, key=lambda p: p.stat().st_size)
+    if result.stat().st_size > MAX_LINK_BYTES:
+        raise RuntimeError("Audio fayl 49 MB dan katta.")
     return result
 
 # ------------------------- ELEVENLABS TTS -------------------------
@@ -845,25 +1224,52 @@ async def handle_text(message: Message):
         await message.answer("Avval erkak yoki ayol ovozini tanlang.", reply_markup=voice_keyboard)
         return
 
-    if mode == "link":
-        if not valid_video_url(text):
-            await message.answer("❌ HTTPS YouTube, Instagram yoki TikTok havolasini yuboring.")
+    if mode in ("link", "pro_links", "pro_mp3"):
+        urls = [u.strip() for u in text.splitlines() if u.strip()]
+        limit = 5 if mode == "pro_links" else 1
+        if len(urls) > limit:
+            await message.answer(f"Bir martada ko‘pi bilan {limit} ta havola yuboring.")
             return
-        status = await message.answer("⚡ Havoladagi video yuklanmoqda...")
+        if not urls or any(not valid_video_url(u) for u in urls):
+            await message.answer("❌ HTTPS YouTube, Instagram yoki TikTok havolalarini yuboring (har birini yangi qatordan).")
+            return
+        if mode in ("pro_links", "pro_mp3") and not is_pro(uid):
+            user_modes.pop(uid, None)
+            await message.answer("🔒 PRO obunangiz faol emas. 💎 PRO sotib olish tugmasini bosing.")
+            return
+        if mode == "pro_links":
+            user_modes[uid] = "pro_quality:" + "\n".join(urls)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"{q}p", callback_data=f"proquality:{q}")]
+                for q in (360, 480, 720, 1080)
+            ])
+            await message.answer("🎞 Video sifatini tanlang:", reply_markup=kb)
+            return
+        status = await message.answer("⚡ Yuklab olinmoqda...")
         try:
             with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
                 async with VIDEO_SEMAPHORE:
-                    path = await download_public_link(text, Path(tmp))
-                    sent = await message.answer_video(FSInputFile(path), caption=f"✅ {detect_platform(text)} videosi tayyor!")
-                    if sent.video:
-                        save_user_video(uid, sent.video.file_id, "video", "Havoladan video")
+                    folder = Path(tmp)
+                    if mode == "pro_mp3":
+                        audio_path = await download_public_audio(urls[0], folder)
+                        sent = await message.answer_audio(FSInputFile(audio_path), title="ASAVED MP3", caption="✅ MP3 tayyor!")
+                        if sent.audio:
+                            save_user_video(uid, sent.audio.file_id, "audio", "Havoladan MP3")
+                    else:
+                        video_path = await download_public_link(urls[0], folder)
+                        sent = await message.answer_video(FSInputFile(video_path), caption=f"✅ {detect_platform(urls[0])} videosi tayyor!")
+                        if sent.video:
+                            save_user_video(uid, sent.video.file_id, "video", "Havoladan video")
             await status.delete()
-            await message.answer("💾 Video «Mening videolarim» bo‘limiga saqlandi.")
         except Exception as exc:
-            log.exception("Link video xatosi")
+            log.exception("Link media xatosi")
             await status.edit_text(f"❌ Yuklab bo‘lmadi: {html.escape(str(exc)[:300])}")
         finally:
             user_modes.pop(uid, None)
+        return
+
+    if mode.startswith("pro_quality:"):
+        await message.answer("Sifat tanlash tugmasidan foydalaning.")
         return
 
     if mode in ("round", "916"):
@@ -945,6 +1351,7 @@ async def on_shutdown(app: web.Application):
 
 async def main():
     init_db()
+    reminder_task = asyncio.create_task(pro_reminder_loop())
     app = web.Application(client_max_size=2 * 1024 * 1024)
     app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
     app.router.add_get("/health", lambda request: web.Response(text="ok"))
@@ -959,7 +1366,12 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info("ASAVED port %s da ishga tushdi", PORT)
-    await asyncio.Event().wait()
+    try:
+        await asyncio.Event().wait()
+    finally:
+        reminder_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reminder_task
 
 if __name__ == "__main__":
     asyncio.run(main())
