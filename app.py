@@ -176,8 +176,19 @@ def init_db():
             file_id TEXT NOT NULL,
             media_type TEXT DEFAULT 'video',
             poster_file_id TEXT,
+            year INTEGER DEFAULT 0,
+            language TEXT DEFAULT 'O‘zbek',
+            downloads INTEGER DEFAULT 0,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
+        # Oldingi bazadagi kinolar uchun yangi ustunlarni xavfsiz qo‘shish
+        movie_columns = {row[1] for row in conn.execute("PRAGMA table_info(movies)").fetchall()}
+        if "year" not in movie_columns:
+            conn.execute("ALTER TABLE movies ADD COLUMN year INTEGER DEFAULT 0")
+        if "language" not in movie_columns:
+            conn.execute("ALTER TABLE movies ADD COLUMN language TEXT DEFAULT 'O‘zbek'")
+        if "downloads" not in movie_columns:
+            conn.execute("ALTER TABLE movies ADD COLUMN downloads INTEGER DEFAULT 0")
         conn.execute("""CREATE TABLE IF NOT EXISTS saved_videos(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -222,15 +233,23 @@ def get_saved_video(video_id: int, user_id: int):
         ).fetchone()
         return row
 
-def save_movie(number, title, description, file_id, media_type, poster_file_id):
+def save_movie(number, title, description, file_id, media_type, poster_file_id, year=0, language="O‘zbek"):
     with db() as conn:
-        conn.execute("""INSERT INTO movies(movie_number,title,description,file_id,media_type,poster_file_id)
-            VALUES(?,?,?,?,?,?)
+        conn.execute("""INSERT INTO movies(movie_number,title,description,file_id,media_type,poster_file_id,year,language)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(movie_number) DO UPDATE SET
             title=excluded.title, description=excluded.description, file_id=excluded.file_id,
-            media_type=excluded.media_type, poster_file_id=excluded.poster_file_id""",
-            (number, title, description, file_id, media_type, poster_file_id))
+            media_type=excluded.media_type, poster_file_id=excluded.poster_file_id,
+            year=excluded.year, language=excluded.language""",
+            (number, title, description, file_id, media_type, poster_file_id, year, language))
         conn.commit()
+
+def increment_movie_downloads(movie_id: int) -> int:
+    with db() as conn:
+        conn.execute("UPDATE movies SET downloads=COALESCE(downloads,0)+1 WHERE id=?", (movie_id,))
+        row = conn.execute("SELECT downloads FROM movies WHERE id=?", (movie_id,)).fetchone()
+        conn.commit()
+        return int(row[0]) if row else 0
 
 def search_movies(query: str):
     with db() as conn:
@@ -271,14 +290,32 @@ async def send_saved_file(chat_id: int, file_id: str, media_type: str, caption: 
         await bot.send_video(chat_id, file_id, caption=caption or None, supports_streaming=True)
 
 async def send_movie(chat_id: int, movie: dict):
-    caption = f"🎬 <b>{html.escape(movie['title'])}</b>"
-    desc = html.escape(movie.get("description") or "")
-    if desc:
-        caption += "\n\n" + desc
+    title = html.escape(movie.get("title") or "Nomsiz kino")
+    year = movie.get("year") or "Ko‘rsatilmagan"
+    language = html.escape(movie.get("language") or "O‘zbek")
+    description = html.escape(movie.get("description") or "")
+    downloads = int(movie.get("downloads") or 0)
+    caption = (
+        f"🎬 <b>{title}</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📅 Yili: <b>{year}</b>\n"
+        f"🌐 Tili: <b>{language}</b>\n"
+        f"🎞 Kino kodi: <b>«{movie['movie_number']}»</b>\n"
+        f"📥 Yuklangan: <b>{downloads} marta</b>"
+    )
+    if description:
+        caption += "\n\n📝 " + description
+    channel_button = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔎 Kino kodini qidirish", url=CHANNEL_URL)
+    ]])
     if movie.get("poster_file_id"):
         await bot.send_photo(chat_id, movie["poster_file_id"], caption=caption[:1024])
-        caption = ""
-    await send_saved_file(chat_id, movie["file_id"], movie["media_type"], caption[:1024])
+        caption = "🎬 <b>Filmni tomosha qiling</b>"
+    if movie["media_type"] == "document":
+        await bot.send_document(chat_id, movie["file_id"], caption=caption[:1024], reply_markup=channel_button)
+    else:
+        await bot.send_video(chat_id, movie["file_id"], caption=caption[:1024],
+                             supports_streaming=True, reply_markup=channel_button)
 
 # ------------------------- SUBSCRIPTION -------------------------
 
@@ -408,6 +445,7 @@ async def movie_callback(callback: CallbackQuery):
         return
     await callback.answer("🎬 Yuborilmoqda...")
     try:
+        movie["downloads"] = increment_movie_downloads(movie["id"])
         await send_movie(callback.from_user.id, movie)
     except Exception:
         log.exception("Kino yuborish xatosi")
@@ -749,6 +787,22 @@ async def handle_text(message: Message):
                 await message.answer("Kino nomi 1–150 belgi bo‘lsin.")
                 return
             upload["title"] = text
+            upload["step"] = "year"
+            await message.answer("📅 Kino yilini yuboring (masalan, 2026) yoki /skip yozing.")
+            return
+        if step == "year":
+            if text == "/skip":
+                upload["year"] = 0
+            elif text.isdigit() and 1888 <= int(text) <= 2100:
+                upload["year"] = int(text)
+            else:
+                await message.answer("Yilni 1888–2100 oralig‘ida kiriting yoki /skip yozing.")
+                return
+            upload["step"] = "language"
+            await message.answer("🌐 Kino tilini yozing (masalan, O‘zbek, Rus, Ingliz).")
+            return
+        if step == "language":
+            upload["language"] = "O‘zbek" if text == "/skip" else text[:40]
             upload["step"] = "description"
             await message.answer("📝 Tavsif yuboring yoki /skip yozing.")
             return
@@ -840,12 +894,13 @@ async def handle_video_or_document(message: Message):
         try:
             save_movie(
                 upload["number"], upload["title"], upload.get("description", ""),
-                file_id, media_type, upload.get("poster_file_id")
+                file_id, media_type, upload.get("poster_file_id"),
+                upload.get("year", 0), upload.get("language", "O‘zbek")
             )
             number, title = upload["number"], upload["title"]
             movie_uploads.pop(uid, None)
             await message.answer(
-                f"✅ <b>Kino saqlandi!</b>\n🔢 Raqami: {number}\n🎬 Nomi: {html.escape(title)}",
+                f"✅ <b>Kino saqlandi!</b>\n🔢 Kodi: {number}\n🎬 Nomi: {html.escape(title)}\n📅 Yili: {upload.get('year', 0) or 'Ko‘rsatilmagan'}\n🌐 Tili: {html.escape(upload.get('language', 'O‘zbek'))}",
                 reply_markup=admin_keyboard()
             )
         except Exception:
