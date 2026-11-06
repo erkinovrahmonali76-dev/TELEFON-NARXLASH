@@ -1,5 +1,4 @@
-aiogram>=3.13,<4
+
+aiogram==3.13.1
 aiohttp
 yt-dlp
-qrcode[pil]
-Pillow
