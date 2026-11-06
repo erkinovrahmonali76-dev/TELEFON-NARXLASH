@@ -54,7 +54,7 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
-DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
+DB_PATH = os.getenv("DB_PATH", "").strip() or "asaved_users.db"
 MAX_VIDEO_MB = 20
 MAX_OUTPUT_MB = 49
 MAX_DURATION = 600
@@ -86,7 +86,11 @@ bot_username = ""
 # DATABASE
 # =========================================================
 def connect_db():
-    con = sqlite3.connect(DB_PATH, timeout=30)
+    # Render konteynerida DB papkasi mavjud va yozish mumkin bo‘lishini ta'minlaymiz.
+    db_file = Path(DB_PATH).expanduser()
+    if db_file.parent != Path("."):
+        db_file.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_file), timeout=30)
     con.row_factory = sqlite3.Row
     return con
 
