@@ -1,6 +1,6 @@
 import asyncio, html, logging, os, re, sqlite3, tempfile
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from typing import Any, Awaitable, Callable
 from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
@@ -147,22 +147,46 @@ async def send_catalog(chat_id, item):
     if item['kind']=='series': cap+=f'📺 Qism: <b>{len(eps)}/{len(eps)}</b>\n'
     cap+=f"📥 Yuklangan: <b>{item['downloads']} marta</b>"
     if item['description']: cap+='\n\n📝 '+html.escape(item['description'])
-    rows=[]
+
+    # Serial ko‘rinishi avvalgidek qoladi.
     if item['kind']=='series':
-        row=[]
+        rows=[]; row=[]
         for eid,num in eps:
             row.append(InlineKeyboardButton(text=f'{num}-qism',callback_data=f'ep:{eid}'))
             if len(row)==3: rows.append(row); row=[]
         if row: rows.append(row)
-    rows.append([InlineKeyboardButton(text='🔎 Kino kodini qidirish',url=CHANNEL_URL)])
-    markup=InlineKeyboardMarkup(inline_keyboard=rows)
-    if item['poster_file_id']: await bot.send_photo(chat_id,item['poster_file_id'],caption=cap[:1024],reply_markup=markup)
-    else: await bot.send_message(chat_id,cap,reply_markup=markup)
-    if item['kind']=='movie':
-        with db() as c: row=c.execute('SELECT file_id,media_type FROM episodes WHERE catalog_id=? AND episode_number=1',(item['id'],)).fetchone()
-        if row:
-            if row[1]=='document': await bot.send_document(chat_id,row[0],caption=f"🎬 {html.escape(item['title'])}")
-            else: await bot.send_video(chat_id,row[0],caption=f"🎬 {html.escape(item['title'])}",supports_streaming=True)
+        rows.append([InlineKeyboardButton(text='🔎 Kino kodini qidirish',url=CHANNEL_URL)])
+        markup=InlineKeyboardMarkup(inline_keyboard=rows)
+        if item['poster_file_id']: await bot.send_photo(chat_id,item['poster_file_id'],caption=cap[:1024],reply_markup=markup)
+        else: await bot.send_message(chat_id,cap,reply_markup=markup)
+        return
+
+    # Bittalik kino: video va ma’lumot bitta xabarda.
+    # "Kino qidirish" tugmasi kanalga olib boradi; "Saqlash" o‘z holicha qoladi.
+    with db() as c: media=c.execute('SELECT file_id,media_type FROM episodes WHERE catalog_id=? AND episode_number=1',(item['id'],)).fetchone()
+    if not media:
+        await bot.send_message(chat_id,cap)
+        return
+    markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='🔎 Kino qidirish',url=CHANNEL_URL)],
+        [InlineKeyboardButton(text='💾 Saqlash',callback_data=f'savecat:{item["id"]}')]
+    ])
+    if media[1]=='document':
+        await bot.send_document(chat_id,media[0],caption=cap[:1024],reply_markup=markup)
+    else:
+        await bot.send_video(chat_id,media[0],caption=cap[:1024],reply_markup=markup,supports_streaming=True)
+
+@router.callback_query(F.data.startswith('savecat:'))
+async def save_catalog_movie(c:CallbackQuery):
+    try: cid=int(c.data.split(':',1)[1]); item=catalog_get(cid)
+    except Exception: item=None
+    if not item or item['kind']!='movie':
+        await c.answer('Kino topilmadi.',show_alert=True); return
+    with db() as conn: media=conn.execute('SELECT file_id,media_type FROM episodes WHERE catalog_id=? AND episode_number=1',(cid,)).fetchone()
+    if not media:
+        await c.answer('Video topilmadi.',show_alert=True); return
+    save_saved(c.from_user.id,media[0],media[1],item['title'])
+    await c.answer('✅ Mening videolarim bo‘limiga saqlandi!',show_alert=True)
 @router.callback_query(F.data.startswith('catalog:'))
 async def catalog_callback(c:CallbackQuery):
     if not await is_subscribed(c.from_user.id,False): await c.answer('Avval kanalga obuna bo‘ling.',show_alert=True); return
