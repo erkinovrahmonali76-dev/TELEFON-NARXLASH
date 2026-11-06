@@ -1,961 +1,423 @@
-import asyncio
-import html
-import logging
-import os
-import re
-import sqlite3
-import tempfile
+import asyncio, html, logging, os, re, sqlite3, tempfile
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Awaitable, Callable
-
 from aiohttp import web, ClientSession, ClientTimeout
 from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# =========================================================
-# ASAVED — barcha funksiyalar
-# =========================================================
-
+# ===================== CONFIG =====================
 logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("asaved")
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
-PORT = int(os.getenv("PORT", "10000"))
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
-
-CHANNEL_USERNAME = "@kinoolamiuzzzz"
-CHANNEL_URL = "https://t.me/kinoolamiuzzzz"
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
-if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
-    raise RuntimeError("WEBHOOK_SECRET noto‘g‘ri yoki kiritilmagan")
-if not BASE_URL:
-    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi")
-
-ADMIN_RAW = os.getenv("ADMIN_IDS", "") or os.getenv("ADMIN_ID", "")
-ADMIN_IDS = {
-    int(x.strip()) for x in ADMIN_RAW.replace(";", ",").split(",")
-    if x.strip().isdigit()
-}
+log = logging.getLogger('kino_olami')
+BOT_TOKEN = os.getenv('BOT_TOKEN','').strip()
+WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET','').strip()
+WEBHOOK_PATH = os.getenv('WEBHOOK_PATH','kino-olami-webhook').strip('/')
+PORT = int(os.getenv('PORT','10000'))
+BASE_URL = os.getenv('RENDER_EXTERNAL_URL','').rstrip('/')
+DB_PATH = os.getenv('DB_PATH','kino_olami.db')
+CHANNEL_USERNAME = '@kinoolamiuzzzz'
+CHANNEL_URL = 'https://t.me/kinoolamiuzzzz'
+ADMIN_RAW = os.getenv('ADMIN_IDS','') or os.getenv('ADMIN_ID','')
+ADMIN_IDS = {int(x.strip()) for x in ADMIN_RAW.replace(';',',').split(',') if x.strip().isdigit()}
+if not BOT_TOKEN: raise RuntimeError('BOT_TOKEN Environment Variable kiritilmagan')
+if not WEBHOOK_SECRET or not re.fullmatch(r'[A-Za-z0-9_-]{16,256}', WEBHOOK_SECRET): raise RuntimeError('WEBHOOK_SECRET noto‘g‘ri')
+if not BASE_URL: raise RuntimeError('RENDER_EXTERNAL_URL topilmadi')
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
+dp = Dispatcher(); router = Router(); dp.include_router(router)
 
-# Tugmalar
-BTN_ROUND = "🎥 Dumaloq video"
-BTN_916 = "📱 9:16 format"
-BTN_LINK = "🔗 Video havolasi"
-BTN_TTS = "🎙️ Matnni ovozga aylantirish"
-BTN_MOVIE_SEARCH = "🎬 Kino qidirish"
-BTN_MY_VIDEOS = "📁 Mening videolarim"
-BTN_ADD_MOVIE = "➕ Kino qo‘shish"
-BTN_BROADCAST = "📢 Reklamani hammaga yuborish"
-BTN_MALE = "👨 Erkak ovozi"
-BTN_FEMALE = "👩 Ayol ovozi"
-BTN_MENU = "⬅️ Asosiy menyu"
+# ===================== BUTTONS / STATE =====================
+BTN_SEARCH='🎬 Kino qidirish'; BTN_ADD='➕ Kino qo‘shish'; BTN_MY='📁 Mening videolarim'
+BTN_ROUND='🎥 Dumaloq video'; BTN_916='📱 9:16 format'; BTN_LINK='🔗 Video havolasi'
+BTN_TTS='🎙️ Matnni ovozga aylantirish'; BTN_BROADCAST='📢 Reklamani hammaga yuborish'
+BTN_MALE='👨 Erkak ovozi'; BTN_FEMALE='👩 Ayol ovozi'; BTN_MENU='⬅️ Asosiy menyu'
+keyboard=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_SEARCH)],[KeyboardButton(text=BTN_ROUND),KeyboardButton(text=BTN_916)],[KeyboardButton(text=BTN_LINK)],[KeyboardButton(text=BTN_TTS)],[KeyboardButton(text=BTN_MY)]],resize_keyboard=True)
+voice_keyboard=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=BTN_MALE),KeyboardButton(text=BTN_FEMALE)],[KeyboardButton(text=BTN_MENU)]],resize_keyboard=True)
+def is_admin(uid): return uid in ADMIN_IDS
+def menu_for(uid):
+    if not is_admin(uid): return keyboard
+    rows=[list(r) for r in keyboard.keyboard]+[[KeyboardButton(text=BTN_ADD)],[KeyboardButton(text=BTN_BROADCAST)]]
+    return ReplyKeyboardMarkup(keyboard=rows,resize_keyboard=True)
+sub_kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🎬 Kino Olami kanaliga obuna bo‘lish',url=CHANNEL_URL)],[InlineKeyboardButton(text='✅ Obunani tekshirish',callback_data='check_sub')]])
+def main_text(): return ('Assalomu alaykum! <b>Kino Olami</b> botiga xush kelibsiz.\n\n🎬 Kino qidirish — kino kodi yoki nomini yuboring.\n📁 Mening videolarim — saqlangan fayllar.\n🎥 Video formatlash va boshqa funksiyalar ham mavjud.')
+user_modes:dict[int,str]={}; uploads:dict[int,dict]={}; sub_cache={}; SUB_TTL=30
+video_sem=asyncio.Semaphore(2); tts_sem=asyncio.Semaphore(2)
+MAX_UPLOAD=20*1024*1024; MAX_OUTPUT=49*1024*1024; MAX_SECONDS=600; MAX_TTS=3000
+ALLOWED_HOSTS={'youtube.com','www.youtube.com','m.youtube.com','youtu.be','instagram.com','www.instagram.com','tiktok.com','www.tiktok.com','vm.tiktok.com','vt.tiktok.com'}
+ELEVEN_KEY=os.getenv('ELEVENLABS_API_KEY','').strip(); TTS_MODEL=os.getenv('ELEVENLABS_MODEL_ID','eleven_multilingual_v2').strip()
+TTS_VOICES={'male':os.getenv('ELEVENLABS_MALE_VOICE_ID','pNInz6obpgDQGcFmaJgB').strip(),'female':os.getenv('ELEVENLABS_FEMALE_VOICE_ID','21m00Tcm4TlvDq8ikWAM').strip()}
+AD_TEXT=('🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\nTelegram kanalingiz rivojlanishini xohlaysizmi?\n📣 Reklama uchun admin: @akramovx7')
 
-user_modes: dict[int, str] = {}
-movie_uploads: dict[int, dict] = {}
-subscription_cache: dict[int, float] = {}
-SUB_CACHE_SECONDS = 30
-
-VIDEO_SEMAPHORE = asyncio.Semaphore(2)
-TTS_SEMAPHORE = asyncio.Semaphore(2)
-
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_OUTPUT_BYTES = 49 * 1024 * 1024
-MAX_LINK_BYTES = 49 * 1024 * 1024
-MAX_SECONDS = 600
-MAX_TTS_CHARS = 3000
-
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-TTS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
-TTS_VOICES = {
-    "male": os.getenv("ELEVENLABS_MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip(),
-    "female": os.getenv("ELEVENLABS_FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip(),
-}
-
-ALLOWED_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
-    "instagram.com", "www.instagram.com",
-    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
-}
-
-AD_TEXT = (
-    "🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\n"
-    "Telegram kanalingiz rivojlanishini xohlaysizmi?\n"
-    "📣 ASAVED orqali reklama joylashtiring!\n\n"
-    "👤 Admin: @akramovx7\n"
-    '<a href="https://t.me/akramovx7">💬 Murojaat qilish</a>'
-)
-
-keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_MOVIE_SEARCH)],
-        [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
-        [KeyboardButton(text=BTN_LINK)],
-        [KeyboardButton(text=BTN_TTS)],
-        [KeyboardButton(text=BTN_MY_VIDEOS)],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Kerakli funksiyani tanlang"
-)
-voice_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text=BTN_MALE), KeyboardButton(text=BTN_FEMALE)],
-        [KeyboardButton(text=BTN_MENU)],
-    ],
-    resize_keyboard=True
-)
-subscribe_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="🎬 Kino Olami kanaliga obuna bo‘lish", url=CHANNEL_URL)],
-    [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")],
-])
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def admin_keyboard() -> ReplyKeyboardMarkup:
-    rows = [list(row) for row in keyboard.keyboard]
-    rows += [
-        [KeyboardButton(text=BTN_ADD_MOVIE)],
-        [KeyboardButton(text=BTN_BROADCAST)],
-    ]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-def menu_for(user_id: int):
-    return admin_keyboard() if is_admin(user_id) else keyboard
-
-def main_text() -> str:
-    return (
-        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
-        "🎬 Kino qidirish — kino nomi yoki raqamini yuboring.\n"
-        "🎥 Dumaloq video — 60 soniyagacha videoni dumaloq qiling.\n"
-        "📱 9:16 format — videoni vertikal formatga o‘tkazing.\n"
-        "🔗 Video havolasi — YouTube, Instagram yoki TikTok.\n"
-        "🎙️ Matnni ovozga aylantirish — matnni MP3 qiling.\n"
-        "📁 Mening videolarim — oldin tayyorlangan fayllarni qayta oling."
-    )
-
-# ------------------------- DATABASE -------------------------
-
-def db():
-    return sqlite3.connect(DB_PATH, timeout=30)
-
+# ===================== DATABASE =====================
+def db(): return sqlite3.connect(DB_PATH,timeout=30)
 def init_db():
-    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with db() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS bot_users(
-            user_id INTEGER PRIMARY KEY,
-            first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
-            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS ad_sent_users(
-            user_id INTEGER PRIMARY KEY,
-            sent_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS movies(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            movie_number INTEGER UNIQUE NOT NULL,
-            title TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            file_id TEXT NOT NULL,
-            media_type TEXT DEFAULT 'video',
-            poster_file_id TEXT,
-            year INTEGER DEFAULT 0,
-            language TEXT DEFAULT 'O‘zbek',
-            downloads INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        # Oldingi bazadagi kinolar uchun yangi ustunlarni xavfsiz qo‘shish
-        movie_columns = {row[1] for row in conn.execute("PRAGMA table_info(movies)").fetchall()}
-        if "year" not in movie_columns:
-            conn.execute("ALTER TABLE movies ADD COLUMN year INTEGER DEFAULT 0")
-        if "language" not in movie_columns:
-            conn.execute("ALTER TABLE movies ADD COLUMN language TEXT DEFAULT 'O‘zbek'")
-        if "downloads" not in movie_columns:
-            conn.execute("ALTER TABLE movies ADD COLUMN downloads INTEGER DEFAULT 0")
-        conn.execute("""CREATE TABLE IF NOT EXISTS saved_videos(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            file_id TEXT NOT NULL,
-            media_type TEXT NOT NULL,
-            label TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )""")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_saved_user ON saved_videos(user_id, id DESC)")
-        conn.commit()
+    Path(DB_PATH).parent.mkdir(parents=True,exist_ok=True)
+    with db() as c:
+        c.execute('CREATE TABLE IF NOT EXISTS bot_users(user_id INTEGER PRIMARY KEY, first_seen TEXT DEFAULT CURRENT_TIMESTAMP,last_seen TEXT DEFAULT CURRENT_TIMESTAMP)')
+        c.execute('CREATE TABLE IF NOT EXISTS ad_sent_users(user_id INTEGER PRIMARY KEY,sent_at TEXT DEFAULT CURRENT_TIMESTAMP)')
+        # Barcha katalog elementlari bitta jadvalda: kind=movie yoki series
+        c.execute('''CREATE TABLE IF NOT EXISTS catalog(id INTEGER PRIMARY KEY AUTOINCREMENT, code INTEGER UNIQUE NOT NULL, kind TEXT NOT NULL,title TEXT NOT NULL,description TEXT DEFAULT '',poster_file_id TEXT,year INTEGER DEFAULT 0,language TEXT DEFAULT 'O‘zbek',downloads INTEGER DEFAULT 0,created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY AUTOINCREMENT,catalog_id INTEGER NOT NULL,episode_number INTEGER NOT NULL,file_id TEXT NOT NULL,media_type TEXT DEFAULT 'video',downloads INTEGER DEFAULT 0,UNIQUE(catalog_id,episode_number))''')
+        c.execute('''CREATE TABLE IF NOT EXISTS saved_videos(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,file_id TEXT NOT NULL,media_type TEXT NOT NULL,label TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_saved_user ON saved_videos(user_id,id DESC)')
+        # Eski app.py dagi movies jadvalidagi bittalik kinolarni yangi katalogga ko‘chirish.
+        old_table=c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='movies'").fetchone()
+        if old_table:
+            cols={r[1] for r in c.execute('PRAGMA table_info(movies)').fetchall()}
+            needed={'movie_number','title','file_id'}
+            if needed.issubset(cols):
+                select_cols=['movie_number','title','description' if 'description' in cols else "''",'poster_file_id' if 'poster_file_id' in cols else 'NULL','year' if 'year' in cols else '0','language' if 'language' in cols else "'O‘zbek'",'downloads' if 'downloads' in cols else '0','file_id','media_type' if 'media_type' in cols else "'video'"]
+                for old in c.execute('SELECT '+','.join(select_cols)+' FROM movies').fetchall():
+                    code,title,desc,poster,year,language,downloads,fid,media_type=old
+                    c.execute('INSERT OR IGNORE INTO catalog(code,kind,title,description,poster_file_id,year,language,downloads) VALUES(?,?,?,?,?,?,?,?)',(code,'movie',title,desc,poster,year,language,downloads))
+                    cat=c.execute('SELECT id FROM catalog WHERE code=?',(code,)).fetchone()
+                    if cat:
+                        c.execute('INSERT OR IGNORE INTO episodes(catalog_id,episode_number,file_id,media_type) VALUES(?,?,?,?)',(cat[0],1,fid,media_type or 'video'))
+        c.commit()
+def register(uid):
+    with db() as c: c.execute('INSERT INTO bot_users(user_id) VALUES(?) ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP',(uid,))
+def all_users():
+    with db() as c: return [r[0] for r in c.execute('SELECT user_id FROM bot_users')]
+def save_saved(uid,fid,typ,label):
+    with db() as c: c.execute('INSERT INTO saved_videos(user_id,file_id,media_type,label) VALUES(?,?,?,?)',(uid,fid,typ,label[:100]))
+def saved_list(uid):
+    with db() as c: return c.execute('SELECT id,label FROM saved_videos WHERE user_id=? ORDER BY id DESC LIMIT 15',(uid,)).fetchall()
+def saved_get(vid,uid):
+    with db() as c: return c.execute('SELECT file_id,media_type,label FROM saved_videos WHERE id=? AND user_id=?',(vid,uid)).fetchone()
+def catalog_search(q):
+    with db() as c:
+        if q.isdigit(): rows=c.execute('SELECT id,code,kind,title FROM catalog WHERE code=?',(int(q),)).fetchall()
+        else: rows=c.execute('SELECT id,code,kind,title FROM catalog WHERE title LIKE ? ORDER BY code LIMIT 15',(f'%{q}%',)).fetchall()
+        return rows
+def catalog_get(cid):
+    with db() as c:
+        c.row_factory=sqlite3.Row; r=c.execute('SELECT * FROM catalog WHERE id=?',(cid,)).fetchone(); return dict(r) if r else None
+def episode_list(cid):
+    with db() as c: return c.execute('SELECT id,episode_number FROM episodes WHERE catalog_id=? ORDER BY episode_number',(cid,)).fetchall()
+def episode_get(eid):
+    with db() as c:
+        c.row_factory=sqlite3.Row; r=c.execute('SELECT e.*,c.title,c.code FROM episodes e JOIN catalog c ON c.id=e.catalog_id WHERE e.id=?',(eid,)).fetchone(); return dict(r) if r else None
 
-def register_user(user_id: int):
-    with db() as conn:
-        conn.execute("""INSERT INTO bot_users(user_id) VALUES(?)
-            ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP""", (user_id,))
-        conn.commit()
-
-def all_user_ids() -> list[int]:
-    with db() as conn:
-        return [int(r[0]) for r in conn.execute("SELECT user_id FROM bot_users").fetchall()]
-
-def save_user_video(user_id: int, file_id: str, media_type: str, label: str):
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO saved_videos(user_id,file_id,media_type,label) VALUES(?,?,?,?)",
-            (user_id, file_id, media_type, label[:100])
-        )
-        conn.commit()
-
-def get_user_videos(user_id: int, limit: int = 15) -> list[tuple]:
-    with db() as conn:
-        return conn.execute(
-            "SELECT id,label,media_type,created_at FROM saved_videos WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, limit)
-        ).fetchall()
-
-def get_saved_video(video_id: int, user_id: int):
-    with db() as conn:
-        row = conn.execute(
-            "SELECT file_id,media_type,label FROM saved_videos WHERE id=? AND user_id=?",
-            (video_id, user_id)
-        ).fetchone()
-        return row
-
-def save_movie(number, title, description, file_id, media_type, poster_file_id, year=0, language="O‘zbek"):
-    with db() as conn:
-        conn.execute("""INSERT INTO movies(movie_number,title,description,file_id,media_type,poster_file_id,year,language)
-            VALUES(?,?,?,?,?,?,?,?)
-            ON CONFLICT(movie_number) DO UPDATE SET
-            title=excluded.title, description=excluded.description, file_id=excluded.file_id,
-            media_type=excluded.media_type, poster_file_id=excluded.poster_file_id,
-            year=excluded.year, language=excluded.language""",
-            (number, title, description, file_id, media_type, poster_file_id, year, language))
-        conn.commit()
-
-def increment_movie_downloads(movie_id: int) -> int:
-    with db() as conn:
-        conn.execute("UPDATE movies SET downloads=COALESCE(downloads,0)+1 WHERE id=?", (movie_id,))
-        row = conn.execute("SELECT downloads FROM movies WHERE id=?", (movie_id,)).fetchone()
-        conn.commit()
-        return int(row[0]) if row else 0
-
-def search_movies(query: str):
-    with db() as conn:
-        conn.row_factory = sqlite3.Row
-        if query.isdigit():
-            rows = conn.execute(
-                "SELECT id,movie_number,title,description FROM movies WHERE movie_number=? LIMIT 10",
-                (int(query),)
-            ).fetchall()
-            if rows:
-                return [tuple(r) for r in rows]
-        rows = conn.execute(
-            "SELECT id,movie_number,title,description FROM movies WHERE title LIKE ? ORDER BY movie_number LIMIT 10",
-            (f"%{query}%",)
-        ).fetchall()
-        return [tuple(r) for r in rows]
-
-def get_movie(movie_id: int):
-    with db() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM movies WHERE id=?", (movie_id,)).fetchone()
-        return dict(row) if row else None
-
-def delete_movie(number: int) -> bool:
-    with db() as conn:
-        cur = conn.execute("DELETE FROM movies WHERE movie_number=?", (number,))
-        conn.commit()
-        return cur.rowcount > 0
-
-async def send_saved_file(chat_id: int, file_id: str, media_type: str, caption: str = ""):
-    if media_type == "video_note":
-        await bot.send_video_note(chat_id, file_id)
-    elif media_type == "audio":
-        await bot.send_audio(chat_id, file_id, caption=caption or None)
-    elif media_type == "document":
-        await bot.send_document(chat_id, file_id, caption=caption or None)
-    else:
-        await bot.send_video(chat_id, file_id, caption=caption or None, supports_streaming=True)
-
-async def send_movie(chat_id: int, movie: dict):
-    title = html.escape(movie.get("title") or "Nomsiz kino")
-    year = movie.get("year") or "Ko‘rsatilmagan"
-    language = html.escape(movie.get("language") or "O‘zbek")
-    description = html.escape(movie.get("description") or "")
-    downloads = int(movie.get("downloads") or 0)
-    caption = (
-        f"🎬 <b>{title}</b>\n"
-        "━━━━━━━━━━━━━━\n"
-        f"📅 Yili: <b>{year}</b>\n"
-        f"🌐 Tili: <b>{language}</b>\n"
-        f"🎞 Kino kodi: <b>«{movie['movie_number']}»</b>\n"
-        f"📥 Yuklangan: <b>{downloads} marta</b>"
-    )
-    if description:
-        caption += "\n\n📝 " + description
-    channel_button = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔎 Kino kodini qidirish", url=CHANNEL_URL)
-    ]])
-    if movie.get("poster_file_id"):
-        await bot.send_photo(chat_id, movie["poster_file_id"], caption=caption[:1024])
-        caption = "🎬 <b>Filmni tomosha qiling</b>"
-    if movie["media_type"] == "document":
-        await bot.send_document(chat_id, movie["file_id"], caption=caption[:1024], reply_markup=channel_button)
-    else:
-        await bot.send_video(chat_id, movie["file_id"], caption=caption[:1024],
-                             supports_streaming=True, reply_markup=channel_button)
-
-# ------------------------- SUBSCRIPTION -------------------------
-
-async def is_subscribed(user_id: int, use_cache=True) -> bool:
-    now = asyncio.get_running_loop().time()
-    if use_cache and subscription_cache.get(user_id, 0) > now:
-        return True
+# ===================== SUBSCRIPTION =====================
+async def is_subscribed(uid,cache=True):
+    now=asyncio.get_running_loop().time()
+    if cache and sub_cache.get(uid,0)>now: return True
     try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        ok = member.status in {
-            ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR
-        }
-        if ok:
-            subscription_cache[user_id] = now + SUB_CACHE_SECONDS
-        else:
-            subscription_cache.pop(user_id, None)
+        m=await bot.get_chat_member(CHANNEL_USERNAME,uid)
+        ok=m.status in {ChatMemberStatus.MEMBER,ChatMemberStatus.ADMINISTRATOR,ChatMemberStatus.CREATOR}
+        if ok: sub_cache[uid]=now+SUB_TTL
+        else: sub_cache.pop(uid,None)
         return ok
-    except Exception:
-        log.exception("Obunani tekshirish xatosi")
-        subscription_cache.pop(user_id, None)
-        return False
-
+    except Exception: log.exception('Subscription check failed'); return False
 class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
-        event: Message,
-        data: dict[str, Any]
-    ) -> Any:
-        if not event.from_user:
-            return await handler(event, data)
-        register_user(event.from_user.id)
-        if event.text and event.text.split()[0].split("@")[0] == "/myid":
-            return await handler(event, data)
-        if await is_subscribed(event.from_user.id):
-            return await handler(event, data)
-        await event.answer(
-            "⛔ ASAVED botidan foydalanish uchun avval Kino Olami kanaliga obuna bo‘ling.",
-            reply_markup=subscribe_keyboard
-        )
-        return None
-
+    async def __call__(self,handler:Callable[[Message,dict[str,Any]],Awaitable[Any]],event:Message,data:dict[str,Any]):
+        if not event.from_user: return await handler(event,data)
+        register(event.from_user.id)
+        if event.text and event.text.split()[0].split('@')[0]=='/myid': return await handler(event,data)
+        if await is_subscribed(event.from_user.id): return await handler(event,data)
+        await event.answer('⛔ Botdan foydalanish uchun avval Kino Olami kanaliga obuna bo‘ling.',reply_markup=sub_kb); return None
 router.message.middleware(SubscriptionMiddleware())
+@router.callback_query(F.data=='check_sub')
+async def check_sub(c:CallbackQuery):
+    if await is_subscribed(c.from_user.id,False):
+        await c.answer('✅ Obuna tasdiqlandi!'); await c.message.answer(main_text(),reply_markup=menu_for(c.from_user.id))
+    else: await c.answer('❌ Avval kanalga obuna bo‘ling!',show_alert=True)
 
-@router.callback_query(F.data == "check_subscription")
-async def check_sub_callback(callback: CallbackQuery):
-    uid = callback.from_user.id
-    register_user(uid)
-    if await is_subscribed(uid, use_cache=False):
-        await callback.answer("✅ Obuna tasdiqlandi!")
-        if callback.message:
-            await callback.message.answer(main_text(), reply_markup=menu_for(uid))
-    else:
-        await callback.answer("❌ Avval kanalga obuna bo‘ling!", show_alert=True)
+# ===================== CATALOG OUTPUT =====================
+async def send_catalog(chat_id, item):
+    eps=episode_list(item['id']) if item['kind']=='series' else []
+    cap=(f"🎬 <b>{html.escape(item['title'])}</b>\n━━━━━━━━━━━━━━\n📅 Yili: <b>{item['year'] or 'Ko‘rsatilmagan'}</b>\n🌐 Tili: <b>{html.escape(item['language'] or 'O‘zbek')}</b>\n🎞 Kino kodi: <b>«{item['code']}»</b>\n")
+    if item['kind']=='series': cap+=f'📺 Qism: <b>{len(eps)}/{len(eps)}</b>\n'
+    cap+=f"📥 Yuklangan: <b>{item['downloads']} marta</b>"
+    if item['description']: cap+='\n\n📝 '+html.escape(item['description'])
+    rows=[]
+    if item['kind']=='series':
+        row=[]
+        for eid,num in eps:
+            row.append(InlineKeyboardButton(text=f'{num}-qism',callback_data=f'ep:{eid}'))
+            if len(row)==3: rows.append(row); row=[]
+        if row: rows.append(row)
+    rows.append([InlineKeyboardButton(text='🔎 Kino kodini qidirish',url=CHANNEL_URL)])
+    markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    if item['poster_file_id']: await bot.send_photo(chat_id,item['poster_file_id'],caption=cap[:1024],reply_markup=markup)
+    else: await bot.send_message(chat_id,cap,reply_markup=markup)
+    if item['kind']=='movie':
+        with db() as c: row=c.execute('SELECT file_id,media_type FROM episodes WHERE catalog_id=? AND episode_number=1',(item['id'],)).fetchone()
+        if row:
+            if row[1]=='document': await bot.send_document(chat_id,row[0],caption=f"🎬 {html.escape(item['title'])}")
+            else: await bot.send_video(chat_id,row[0],caption=f"🎬 {html.escape(item['title'])}",supports_streaming=True)
+@router.callback_query(F.data.startswith('catalog:'))
+async def catalog_callback(c:CallbackQuery):
+    if not await is_subscribed(c.from_user.id,False): await c.answer('Avval kanalga obuna bo‘ling.',show_alert=True); return
+    try: item=catalog_get(int(c.data.split(':')[1]))
+    except Exception: item=None
+    if not item: await c.answer('Kino topilmadi.',show_alert=True); return
+    await c.answer('🎬 Ochilmoqda...')
+    with db() as conn: conn.execute('UPDATE catalog SET downloads=downloads+1 WHERE id=?',(item['id'],))
+    item['downloads']+=1
+    await send_catalog(c.from_user.id,item)
+@router.callback_query(F.data.startswith('ep:'))
+async def episode_callback(c:CallbackQuery):
+    if not await is_subscribed(c.from_user.id,False): await c.answer('Avval kanalga obuna bo‘ling.',show_alert=True); return
+    try: ep=episode_get(int(c.data.split(':')[1]))
+    except Exception: ep=None
+    if not ep: await c.answer('Qism topilmadi.',show_alert=True); return
+    await c.answer('📥 Video yuborilmoqda...')
+    cap=f"🎬 <b>{html.escape(ep['title'])}</b>\n📺 Qism: <b>{ep['episode_number']}-qism</b>"
+    if ep['media_type']=='document': await bot.send_document(c.from_user.id,ep['file_id'],caption=cap)
+    else: await bot.send_video(c.from_user.id,ep['file_id'],caption=cap,supports_streaming=True)
+    with db() as conn: conn.execute('UPDATE episodes SET downloads=downloads+1 WHERE id=?',(ep['id'],)); conn.execute('UPDATE catalog SET downloads=downloads+1 WHERE id=?',(ep['catalog_id'],))
 
-# ------------------------- BASIC COMMANDS -------------------------
+# ===================== ADMIN ADD WIZARD =====================
+@router.message(Command('addmovie'))
+@router.message(F.text==BTN_ADD)
+async def add_start(m:Message):
+    if not is_admin(m.from_user.id): await m.answer('⛔ Faqat admin uchun.'); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🎬 Bittalik kino',callback_data='kind:movie')],[InlineKeyboardButton(text='📺 Serial',callback_data='kind:series')]])
+    uploads[m.from_user.id]={'step':'kind'}; await m.answer('Qanday kontent qo‘shmoqchisiz?',reply_markup=kb)
+@router.callback_query(F.data.startswith('kind:'))
+async def choose_kind(c:CallbackQuery):
+    if not is_admin(c.from_user.id): await c.answer('Ruxsat yo‘q',show_alert=True); return
+    u=uploads.get(c.from_user.id)
+    if not u: await c.answer('Jarayon topilmadi',show_alert=True); return
+    u['kind']=c.data.split(':')[1]; u['step']='code'; await c.answer(); await c.message.answer('🔢 Kino/serial kodini yuboring:')
+@router.message(Command('cancel'))
+async def cancel(m:Message): uploads.pop(m.from_user.id,None); await m.answer('❌ Bekor qilindi.',reply_markup=menu_for(m.from_user.id))
+@router.message(Command('doneepisodes'))
+async def done_episodes(m:Message):
+    u=uploads.get(m.from_user.id)
+    if not is_admin(m.from_user.id) or not u or u.get('kind')!='series' or u.get('step')!='media' or u.get('count',0)<1: await m.answer('❌ Yakunlash uchun faol serial va kamida bitta qism kerak.'); return
+    await m.answer(f"✅ Serial saqlandi!\n🎬 {html.escape(u['title'])}\n🔢 Kod: {u['code']}\n📺 Qismlar: {u['count']} ta",reply_markup=menu_for(m.from_user.id)); uploads.pop(m.from_user.id,None)
+@router.message(F.text==BTN_SEARCH)
+async def search_start(m:Message): user_modes[m.from_user.id]='search'; await m.answer('🎬 Kino yoki serial nomini/kodini yuboring:')
+async def show_results(m,q):
+    rows=catalog_search(q); buttons=[]
+    for cid,code,kind,title in rows:
+        label='📺' if kind=='series' else '🎬'; suffix=' (Serial)' if kind=='series' else ''
+        buttons.append([InlineKeyboardButton(text=f'{label} {code}. {title[:38]}{suffix}',callback_data=f'catalog:{cid}')])
+    if not buttons: await m.answer('😕 Bunday kino yoki serial topilmadi.'); return
+    await m.answer('🔎 Topilgan natijalar:',reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
-@router.message(Command("myid"))
-async def myid(message: Message):
-    await message.answer(
-        f"🆔 Telegram ID: <code>{message.from_user.id}</code>\n"
-        "Render → Environment → ADMIN_IDS ga kiriting."
-    )
+# ===================== MEDIA HELPERS / VIDEO TOOLS =====================
+def get_video_info(m):
+    if m.video: return m.video.file_id,m.video.file_size,m.video.duration,'video'
+    if m.document and (m.document.mime_type or '').startswith('video/'): return m.document.file_id,m.document.file_size,None,'document'
+    return None
+async def download_tg(m,path):
+    info=get_video_info(m)
+    if not info: raise ValueError('Video topilmadi')
+    fid,size,dur,_=info
+    if size and size>MAX_UPLOAD: raise ValueError('Video 20 MB dan katta')
+    if dur and dur>MAX_SECONDS: raise ValueError('Video 10 daqiqadan uzun')
+    f=await bot.get_file(fid); await bot.download_file(f.file_path,destination=path)
+async def ffmpeg(args):
+    p=await asyncio.create_subprocess_exec('ffmpeg','-y','-hide_banner','-loglevel','error',*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE); _,err=await p.communicate()
+    if p.returncode: raise RuntimeError(err.decode('utf-8','ignore')[-500:])
+async def process_format(m,mode):
+    status=await m.answer('⚡ Video tayyorlanmoqda...'); uid=m.from_user.id
+    try:
+        async with video_sem:
+            with tempfile.TemporaryDirectory() as td:
+                src=Path(td)/'in.mp4'; dst=Path(td)/'out.mp4'; await download_tg(m,src)
+                if mode=='round':
+                    await ffmpeg(['-i',str(src),'-t','60','-vf','scale=640:640:force_original_aspect_ratio=increase,crop=640:640,setsar=1','-c:v','libx264','-preset','ultrafast','-crf','27','-c:a','aac','-b:a','96k',str(dst)])
+                    if dst.stat().st_size>MAX_OUTPUT: raise ValueError('Tayyor video 49 MB dan katta')
+                    sent=await m.answer_video_note(FSInputFile(dst)); save_saved(uid,sent.video_note.file_id,'video_note','Dumaloq video')
+                else:
+                    await ffmpeg(['-i',str(src),'-vf','scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1','-c:v','libx264','-preset','ultrafast','-crf','26','-c:a','aac','-b:a','128k',str(dst)])
+                    if dst.stat().st_size>MAX_OUTPUT: raise ValueError('Tayyor video 49 MB dan katta')
+                    sent=await m.answer_video(FSInputFile(dst),caption='📱 9:16 format tayyor!'); save_saved(uid,sent.video.file_id,'video','9:16 video')
+        await status.delete(); await m.answer('💾 Mening videolarim bo‘limiga saqlandi.')
+    except Exception as e: log.exception('format'); await status.edit_text('❌ '+html.escape(str(e)[:300]))
+    finally: user_modes.pop(uid,None)
 
+# ===================== LINK DOWNLOAD =====================
+def valid_url(raw):
+    try:
+        p=urlparse(raw.strip()); h=(p.hostname or '').lower(); return p.scheme=='https' and any(h==x or h.endswith('.'+x) for x in ALLOWED_HOSTS)
+    except Exception: return False
+def platform(url):
+    h=urlparse(url).hostname or ''; return 'Instagram' if 'instagram' in h else 'TikTok' if 'tiktok' in h else 'YouTube'
+async def download_link(url,folder):
+    import yt_dlp
+    opts={'format':'bestvideo+bestaudio/best','outtmpl':str(folder/'video.%(ext)s'),'noplaylist':True,'max_filesize':49*1024*1024,'quiet':True,'no_warnings':True,'merge_output_format':'mp4','socket_timeout':20}
+    def work():
+        with yt_dlp.YoutubeDL(opts) as y: y.download([url])
+    await asyncio.to_thread(work); fs=list(folder.glob('video.*'))
+    if not fs: raise RuntimeError('Video olinmadi')
+    p=max(fs,key=lambda x:x.stat().st_size)
+    if p.stat().st_size>49*1024*1024: raise RuntimeError('Video 49 MB dan katta')
+    return p
+
+# ===================== TTS =====================
+async def tts(text,voice,dst):
+    if not ELEVEN_KEY: raise RuntimeError('ELEVENLABS_API_KEY kiritilmagan')
+    url=f'https://api.elevenlabs.io/v1/text-to-speech/{voice}'; headers={'xi-api-key':ELEVEN_KEY,'Accept':'audio/mpeg','Content-Type':'application/json'}
+    async with ClientSession(timeout=ClientTimeout(total=120)) as s:
+        async with s.post(url,headers=headers,json={'text':text,'model_id':TTS_MODEL,'voice_settings':{'stability':0.5,'similarity_boost':0.75}}) as r:
+            if r.status!=200: raise RuntimeError(f'ElevenLabs API xatosi: {r.status} {(await r.text())[:150]}')
+            data=await r.read()
+    if not data: raise RuntimeError('Audio bo‘sh qaytdi')
+    dst.write_bytes(data)
+async def process_tts(m,text,mode):
+    if not text.strip() or len(text)>MAX_TTS: await m.answer(f'Matn 1–{MAX_TTS} belgi bo‘lsin.'); return
+    key='male' if mode=='tts_male' else 'female'; status=await m.answer('🎙️ Ovoz yaratilmoqda...')
+    try:
+        async with tts_sem:
+            with tempfile.TemporaryDirectory() as td:
+                p=Path(td)/'voice.mp3'; await tts(text,TTS_VOICES[key],p); sent=await m.answer_audio(FSInputFile(p),title='Kino Olami AI ovoz'); save_saved(m.from_user.id,sent.audio.file_id,'audio','AI ovoz')
+        await status.delete()
+    except Exception as e: log.exception('tts'); await status.edit_text('❌ '+html.escape(str(e)[:300]))
+    finally: user_modes.pop(m.from_user.id,None)
+
+# ===================== COMMON COMMANDS / MENUS =====================
 @router.message(CommandStart())
-async def start(message: Message):
-    user_modes.pop(message.from_user.id, None)
-    await message.answer(main_text(), reply_markup=menu_for(message.from_user.id))
+async def start(m:Message): user_modes.pop(m.from_user.id,None); await m.answer(main_text(),reply_markup=menu_for(m.from_user.id))
+@router.message(Command('myid'))
+async def myid(m:Message): await m.answer(f'🆔 Telegram ID: <code>{m.from_user.id}</code>\nADMIN_IDS ga kiriting.')
+@router.message(Command('admin'))
+async def admin(m:Message):
+    if not is_admin(m.from_user.id): await m.answer('⛔ Ruxsat yo‘q.'); return
+    await m.answer(f'🛠 Admin panel\n👥 Foydalanuvchilar: {len(all_users())}',reply_markup=menu_for(m.from_user.id))
+@router.message(F.text==BTN_MY)
+async def my_videos(m:Message):
+    rows=saved_list(m.from_user.id)
+    if not rows: await m.answer('📁 Saqlangan videolar yo‘q.'); return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='📹 '+label[:40],callback_data=f'saved:{vid}')] for vid,label in rows]); await m.answer('📁 Saqlangan fayllar:',reply_markup=kb)
+@router.callback_query(F.data.startswith('saved:'))
+async def saved_cb(c:CallbackQuery):
+    try: vid=int(c.data.split(':')[1]); row=saved_get(vid,c.from_user.id)
+    except Exception: row=None
+    if not row: await c.answer('Topilmadi',show_alert=True); return
+    fid,typ,label=row; await c.answer('Yuborilmoqda...')
+    if typ=='video_note': await bot.send_video_note(c.from_user.id,fid)
+    elif typ=='audio': await bot.send_audio(c.from_user.id,fid)
+    elif typ=='document': await bot.send_document(c.from_user.id,fid)
+    else: await bot.send_video(c.from_user.id,fid,supports_streaming=True)
+@router.message(F.text==BTN_ROUND)
+async def round_start(m): user_modes[m.from_user.id]='round'; await m.answer('🎥 60 soniyagacha, 20 MB gacha video yuboring.')
+@router.message(F.text==BTN_916)
+async def vertical_start(m): user_modes[m.from_user.id]='916'; await m.answer('📱 20 MB gacha video yuboring.')
+@router.message(F.text==BTN_LINK)
+async def link_start(m): user_modes[m.from_user.id]='link'; await m.answer('🔗 YouTube, Instagram yoki TikTok havolasini yuboring.')
+@router.message(F.text==BTN_TTS)
+async def tts_start(m): user_modes[m.from_user.id]='voice_choose'; await m.answer('Ovoz turini tanlang:',reply_markup=voice_keyboard)
+@router.message(F.text==BTN_MALE)
+async def male(m): user_modes[m.from_user.id]='tts_male'; await m.answer('👨 Matn yuboring.',reply_markup=menu_for(m.from_user.id))
+@router.message(F.text==BTN_FEMALE)
+async def female(m): user_modes[m.from_user.id]='tts_female'; await m.answer('👩 Matn yuboring.',reply_markup=menu_for(m.from_user.id))
+@router.message(F.text==BTN_MENU)
+async def back(m): user_modes.pop(m.from_user.id,None); await m.answer(main_text(),reply_markup=menu_for(m.from_user.id))
 
-@router.message(Command("admin"))
-async def admin_panel(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Sizda admin huquqi yo‘q.")
+# ===================== BROADCAST =====================
+@router.message(F.text==BTN_BROADCAST)
+async def broadcast_start(m):
+    if not is_admin(m.from_user.id): return
+    kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='✅ Ha',callback_data='bc:yes')],[InlineKeyboardButton(text='❌ Bekor',callback_data='bc:no')]])
+    await m.answer(f'{len(all_users())} foydalanuvchiga xabar yuborilsinmi?',reply_markup=kb)
+@router.callback_query(F.data.startswith('bc:'))
+async def broadcast_cb(c):
+    if not is_admin(c.from_user.id): await c.answer('Ruxsat yo‘q',show_alert=True); return
+    if c.data=='bc:no': await c.answer('Bekor qilindi'); await c.message.edit_text('❌ Bekor qilindi'); return
+    await c.answer('Yuborish boshlandi'); await c.message.edit_text('⏳ Yuborilmoqda...'); sent=fail=0
+    for uid in all_users():
+        try: await bot.send_message(uid,AD_TEXT); sent+=1
+        except Exception: fail+=1
+        await asyncio.sleep(.05)
+    await c.message.answer(f'✅ Tugadi. Yuborildi: {sent}; Xato: {fail}',reply_markup=menu_for(c.from_user.id))
+
+# ===================== TEXT ROUTER =====================
+@router.message(F.text)
+async def text_handler(m:Message):
+    text=(m.text or '').strip(); uid=m.from_user.id; u=uploads.get(uid); mode=user_modes.get(uid)
+    if u:
+        step=u.get('step')
+        if step=='code':
+            if not text.isdigit() or int(text)<1: await m.answer('Musbat raqam yuboring.'); return
+            if catalog_search(text): await m.answer('❌ Bu kod band. Boshqa kod yuboring.'); return
+            u['code']=int(text); u['step']='title'; await m.answer('🎬 Nomi qanday?'); return
+        if step=='title':
+            if not text or len(text)>150: await m.answer('Nom 1–150 belgi bo‘lsin.'); return
+            u['title']=text; u['step']='year'; await m.answer('📅 Yilini yuboring yoki /skip.'); return
+        if step=='year':
+            if text=='/skip': u['year']=0
+            elif text.isdigit() and 1888<=int(text)<=2100: u['year']=int(text)
+            else: await m.answer('Yilni to‘g‘ri kiriting yoki /skip.'); return
+            u['step']='language'; await m.answer('🌐 Tilini yozing (O‘zbek, Rus, Ingliz...).'); return
+        if step=='language': u['language']=text[:40]; u['step']='description'; await m.answer('📝 Tavsif yoki /skip.'); return
+        if step=='description': u['description']='' if text=='/skip' else text[:800]; u['step']='poster'; await m.answer('🖼 Poster yuboring yoki /skip.'); return
+        if step=='poster':
+            if text!='/skip': await m.answer('Poster yuboring yoki /skip.'); return
+            u['poster']=None; await create_catalog_record(m,u); return
+        if step=='media': await m.answer('🎞 Video yuboring. Serial tugasa /doneepisodes yozing.'); return
+    if mode=='search': user_modes.pop(uid,None); await show_results(m,text); return
+    if mode in ('tts_male','tts_female'): await process_tts(m,text,mode); return
+    if mode=='voice_choose': await m.answer('Erkak yoki ayol ovozini tanlang.',reply_markup=voice_keyboard); return
+    if mode=='link':
+        if not valid_url(text): await m.answer('❌ HTTPS YouTube, Instagram yoki TikTok havolasini yuboring.'); return
+        status=await m.answer('⚡ Video yuklanmoqda...')
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                async with video_sem: p=await download_link(text,Path(td)); sent=await m.answer_video(FSInputFile(p),caption=f'✅ {platform(text)} videosi')
+                save_saved(uid,sent.video.file_id,'video','Havoladan video')
+            await status.delete()
+        except Exception as e: log.exception('link'); await status.edit_text('❌ '+html.escape(str(e)[:300]))
+        finally: user_modes.pop(uid,None)
         return
-    await message.answer(
-        f"🛠 <b>Admin panel</b>\n👥 Foydalanuvchilar: {len(all_user_ids())}\n"
-        "Kino qo‘shish: ➕ Kino qo‘shish",
-        reply_markup=admin_keyboard()
-    )
+    if mode in ('round','916'): await m.answer('Galereyadan video yuboring.'); return
+    if text.isdigit(): await show_results(m,text); return
+    await m.answer('Menyudan kerakli funksiyani tanlang.',reply_markup=menu_for(uid))
 
-# ------------------------- MOVIE MANAGEMENT -------------------------
-
-@router.message(Command("addmovie"))
-@router.message(F.text == BTN_ADD_MOVIE)
-async def add_movie_start(message: Message):
-    uid = message.from_user.id
-    if not is_admin(uid):
-        await message.answer("⛔ Bu funksiya faqat admin uchun.")
-        return
-    movie_uploads[uid] = {"step": "number"}
-    await message.answer("➕ Kino raqamini yuboring. Bekor qilish: /cancel")
-
-@router.message(Command("cancel"))
-async def cancel_upload(message: Message):
-    movie_uploads.pop(message.from_user.id, None)
-    await message.answer("❌ Amal bekor qilindi.", reply_markup=menu_for(message.from_user.id))
-
-@router.message(Command("delmovie"))
-async def del_movie(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("⛔ Ruxsat yo‘q.")
-        return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2 or not parts[1].isdigit():
-        await message.answer("Ishlatish: <code>/delmovie 6</code>")
-        return
-    await message.answer(
-        "🗑 Kino o‘chirildi." if delete_movie(int(parts[1])) else "Bunday kino topilmadi."
-    )
-
-@router.message(F.text == BTN_MOVIE_SEARCH)
-async def movie_search_start(message: Message):
-    user_modes[message.from_user.id] = "movie_search"
-    await message.answer("🎬 Kino nomini yoki raqamini yuboring.")
-
-@router.callback_query(F.data.startswith("movie:"))
-async def movie_callback(callback: CallbackQuery):
-    if not await is_subscribed(callback.from_user.id, use_cache=False):
-        await callback.answer("Avval kanalga obuna bo‘ling.", show_alert=True)
-        return
+async def create_catalog_record(m,u):
     try:
-        movie = get_movie(int(callback.data.split(":", 1)[1]))
-    except (ValueError, IndexError):
-        movie = None
-    if not movie:
-        await callback.answer("Kino topilmadi.", show_alert=True)
-        return
-    await callback.answer("🎬 Yuborilmoqda...")
-    try:
-        movie["downloads"] = increment_movie_downloads(movie["id"])
-        await send_movie(callback.from_user.id, movie)
-    except Exception:
-        log.exception("Kino yuborish xatosi")
-        if callback.message:
-            await callback.message.answer("❌ Kinoni yuborib bo‘lmadi.")
+        with db() as c:
+            cur=c.execute('INSERT INTO catalog(code,kind,title,description,poster_file_id,year,language) VALUES(?,?,?,?,?,?,?)',(u['code'],u['kind'],u['title'],u['description'],u.get('poster'),u['year'],u['language'])); cid=cur.lastrowid
+        u['catalog_id']=cid; u['count']=0; u['step']='media'
+        if u['kind']=='movie': await m.answer('🎞 Endi bittalik kino videosini yuboring.')
+        else: await m.answer('🎞 Serialning 1-qismini yuboring. Keyingi qismlarni ketma-ket yuboring. Yakunlash: /doneepisodes')
+    except sqlite3.IntegrityError: uploads.pop(m.from_user.id,None); await m.answer('❌ Bu kod band.')
 
 @router.message(F.photo)
-async def movie_poster(message: Message):
-    uid = message.from_user.id
-    upload = movie_uploads.get(uid)
-    if not upload or upload.get("step") != "poster":
-        return
-    upload["poster_file_id"] = message.photo[-1].file_id
-    upload["step"] = "video"
-    await message.answer("✅ Poster olindi. Endi kino videosini yoki video faylni yuboring.")
-
-# ------------------------- VIDEO HELPERS -------------------------
-
-def get_video_info(message: Message):
-    if message.video:
-        return message.video.file_id, message.video.file_size, message.video.duration, "video"
-    if message.document and (message.document.mime_type or "").startswith("video/"):
-        return message.document.file_id, message.document.file_size, None, "document"
-    return None
-
-async def run_ffmpeg(args: list[str]):
-    proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(stderr.decode("utf-8", "ignore")[-1000:] or "FFmpeg xatosi")
-
-async def download_telegram_video(message: Message, target: Path):
-    info = get_video_info(message)
-    if not info:
-        raise ValueError("Video topilmadi.")
-    file_id, size, duration, _ = info
-    if size and size > MAX_UPLOAD_BYTES:
-        raise ValueError("Video 20 MB dan katta.")
-    if duration and duration > MAX_SECONDS:
-        raise ValueError("Video 10 daqiqadan uzun.")
-    tg_file = await bot.get_file(file_id)
-    await bot.download_file(tg_file.file_path, destination=target)
-    return target
-
-async def make_round(src: Path, dst: Path):
-    await run_ffmpeg([
-        "-i", str(src), "-t", "60",
-        "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
-        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27",
-        "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-movflags", "+faststart", str(dst)
-    ])
-
-async def make_916(src: Path, dst: Path):
-    await run_ffmpeg([
-        "-i", str(src),
-        "-vf", "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
-        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "26",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)
-    ])
-
-async def process_uploaded_video(message: Message, mode: str):
-    status = await message.answer("⚡ Video tayyorlanmoqda...")
-    uid = message.from_user.id
-    try:
-        async with VIDEO_SEMAPHORE:
-            with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
-                folder = Path(tmp)
-                src, dst = folder / "input_video", folder / "output.mp4"
-                await download_telegram_video(message, src)
-                if mode == "round":
-                    await make_round(src, dst)
-                    if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                        raise ValueError("Tayyor video 49 MB dan katta.")
-                    sent = await message.answer_video_note(FSInputFile(dst))
-                    if sent.video_note:
-                        save_user_video(uid, sent.video_note.file_id, "video_note", "Dumaloq video")
-                else:
-                    await make_916(src, dst)
-                    if dst.stat().st_size > MAX_OUTPUT_BYTES:
-                        raise ValueError("Tayyor video 49 MB dan katta.")
-                    sent = await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
-                    if sent.video:
-                        save_user_video(uid, sent.video.file_id, "video", "9:16 video")
-        await status.delete()
-        await message.answer("💾 Video «Mening videolarim» bo‘limiga saqlandi.")
-    except Exception as exc:
-        log.exception("Video qayta ishlash xatosi")
-        await status.edit_text(f"❌ Xatolik: {html.escape(str(exc)[:500])}")
-    finally:
-        user_modes.pop(uid, None)
-
-# ------------------------- SAVED VIDEOS -------------------------
-
-@router.message(F.text == BTN_MY_VIDEOS)
-async def my_videos(message: Message):
-    rows = get_user_videos(message.from_user.id)
-    if not rows:
-        await message.answer("📁 Hozircha saqlangan videolaringiz yo‘q.")
-        return
-    buttons = []
-    for video_id, label, media_type, created_at in rows:
-        buttons.append([InlineKeyboardButton(
-            text=f"📹 {label[:40]}",
-            callback_data=f"saved:{video_id}"
-        )])
-    await message.answer("📁 <b>Oxirgi 15 ta saqlangan videongiz:</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-
-@router.callback_query(F.data.startswith("saved:"))
-async def saved_video_callback(callback: CallbackQuery):
-    try:
-        video_id = int(callback.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        await callback.answer("Noto‘g‘ri so‘rov.")
-        return
-    row = get_saved_video(video_id, callback.from_user.id)
-    if not row:
-        await callback.answer("Video topilmadi.", show_alert=True)
-        return
-    file_id, media_type, label = row
-    await callback.answer("📹 Video yuborilmoqda...")
-    try:
-        await send_saved_file(callback.from_user.id, file_id, media_type, f"📁 {html.escape(label)}")
-    except Exception:
-        log.exception("Saqlangan video yuborilmadi")
-        if callback.message:
-            await callback.message.answer("❌ Videoni qayta yuborib bo‘lmadi.")
-
-# ------------------------- VIDEO MODE BUTTONS -------------------------
-
-@router.message(F.text == BTN_ROUND)
-async def choose_round(message: Message):
-    user_modes[message.from_user.id] = "round"
-    await message.answer("🎥 Galereyadan 60 soniyagacha video yuboring (20 MB gacha).")
-
-@router.message(F.text == BTN_916)
-async def choose_916(message: Message):
-    user_modes[message.from_user.id] = "916"
-    await message.answer("📱 9:16 formatga o‘tkazish uchun video yuboring (20 MB gacha).")
-
-@router.message(F.text == BTN_LINK)
-async def choose_link(message: Message):
-    user_modes[message.from_user.id] = "link"
-    await message.answer("🔗 YouTube, Instagram yoki TikTok havolasini yuboring.")
-
-@router.message(F.text == BTN_TTS)
-async def choose_tts(message: Message):
-    user_modes[message.from_user.id] = "voice_choose"
-    await message.answer("🎙️ Ovoz turini tanlang:", reply_markup=voice_keyboard)
-
-@router.message(F.text == BTN_MALE)
-async def choose_male(message: Message):
-    user_modes[message.from_user.id] = "tts_male"
-    await message.answer("👨 Erkak ovozi tanlandi. Matn yuboring.", reply_markup=menu_for(message.from_user.id))
-
-@router.message(F.text == BTN_FEMALE)
-async def choose_female(message: Message):
-    user_modes[message.from_user.id] = "tts_female"
-    await message.answer("👩 Ayol ovozi tanlandi. Matn yuboring.", reply_markup=menu_for(message.from_user.id))
-
-@router.message(F.text == BTN_MENU)
-async def back_menu(message: Message):
-    user_modes.pop(message.from_user.id, None)
-    await message.answer(main_text(), reply_markup=menu_for(message.from_user.id))
-
-# ------------------------- LINK DOWNLOADER -------------------------
-
-def valid_video_url(raw: str) -> bool:
-    try:
-        parsed = urlparse(raw.strip())
-        host = (parsed.hostname or "").lower()
-        return parsed.scheme == "https" and (
-            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
-        )
-    except Exception:
-        return False
-
-def detect_platform(url: str):
-    host = (urlparse(url).hostname or "").lower()
-    if "instagram.com" in host:
-        return "Instagram"
-    if "tiktok.com" in host:
-        return "TikTok"
-    return "YouTube"
-
-async def download_public_link(url: str, folder: Path) -> Path:
-    try:
-        import yt_dlp
-    except ImportError:
-        raise RuntimeError("yt-dlp o‘rnatilmagan.")
-    opts = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": str(folder / "link_video.%(ext)s"),
-        "noplaylist": True,
-        "max_filesize": MAX_LINK_BYTES,
-        "socket_timeout": 20,
-        "retries": 1,
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": "mp4",
-        "remuxvideo": "mp4",
-    }
-    def work():
-        import yt_dlp
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    await asyncio.to_thread(work)
-    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
-    if not files:
-        raise RuntimeError("Video yuklab olinmadi.")
-    result = max(files, key=lambda p: p.stat().st_size)
-    if result.stat().st_size > MAX_LINK_BYTES:
-        raise RuntimeError("Video 49 MB dan katta.")
-    return result
-
-# ------------------------- ELEVENLABS TTS -------------------------
-
-async def text_to_speech(text: str, voice_id: str, destination: Path):
-    if not ELEVENLABS_API_KEY:
-        raise RuntimeError("ELEVENLABS_API_KEY kiritilmagan.")
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
-    payload = {
-        "text": text, "model_id": TTS_MODEL_ID,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-    }
-    timeout = ClientTimeout(total=120, connect=20)
-    async with ClientSession(timeout=timeout) as session:
-        async with session.post(url, headers=headers, json=payload) as response:
-            if response.status != 200:
-                detail = (await response.text())[:300]
-                log.error("ElevenLabs %s: %s", response.status, detail)
-                if response.status == 401:
-                    raise RuntimeError("ElevenLabs API kaliti noto‘g‘ri.")
-                if response.status == 429:
-                    raise RuntimeError("ElevenLabs limiti tugagan.")
-                raise RuntimeError(f"ElevenLabs API xatosi: {response.status}")
-            data = await response.read()
-    if not data:
-        raise RuntimeError("Audio bo‘sh qaytdi.")
-    destination.write_bytes(data)
-
-async def process_tts(message: Message, text: str, mode: str):
-    if not text.strip():
-        await message.answer("Matn yuboring.")
-        return
-    if len(text) > MAX_TTS_CHARS:
-        await message.answer(f"Matn {MAX_TTS_CHARS} belgidan oshmasin.")
-        return
-    voice_key = "male" if mode == "tts_male" else "female"
-    status = await message.answer("🎙️ Matn ovozga aylantirilmoqda...")
-    try:
-        async with TTS_SEMAPHORE:
-            with tempfile.TemporaryDirectory(prefix="asaved_tts_") as tmp:
-                audio = Path(tmp) / "voice.mp3"
-                await text_to_speech(text, TTS_VOICES[voice_key], audio)
-                sent = await message.answer_audio(
-                    FSInputFile(audio), title="ASAVED AI ovoz",
-                    caption=f"✅ {'Erkak' if voice_key == 'male' else 'Ayol'} AI ovozi"
-                )
-                if sent.audio:
-                    save_user_video(message.from_user.id, sent.audio.file_id, "audio", "AI ovoz")
-        await status.delete()
-        await message.answer("💾 Audio ham «Mening videolarim» bo‘limiga saqlandi.")
-    except Exception as exc:
-        log.exception("TTS xatosi")
-        await status.edit_text(f"❌ Ovoz yaratilmadi: {html.escape(str(exc)[:300])}")
-    finally:
-        user_modes.pop(message.from_user.id, None)
-
-# ------------------------- BROADCAST -------------------------
-
-@router.message(F.text == BTN_BROADCAST)
-async def broadcast_start(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Ha, yuborish", callback_data="broadcast:yes")],
-        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="broadcast:no")]
-    ])
-    await message.answer(f"📢 Xabar {len(all_user_ids())} foydalanuvchiga yuboriladi. Davom etasizmi?", reply_markup=kb)
-
-@router.callback_query(F.data == "broadcast:no")
-async def broadcast_cancel(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo‘q.", show_alert=True)
-        return
-    await callback.answer("Bekor qilindi.")
-    if callback.message:
-        await callback.message.edit_text("❌ Reklama bekor qilindi.")
-
-@router.callback_query(F.data == "broadcast:yes")
-async def broadcast_confirm(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Ruxsat yo‘q.", show_alert=True)
-        return
-    await callback.answer("Yuborish boshlandi.")
-    if callback.message:
-        await callback.message.edit_text("⏳ Yuborilmoqda...")
-    ids = all_user_ids()
-    sent = failed = 0
-    for uid in ids:
-        try:
-            await bot.send_message(uid, AD_TEXT)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)
-    if callback.message:
-        await callback.message.answer(
-            f"✅ Yakunlandi.\n👥 Jami: {len(ids)}\n✅ Yuborildi: {sent}\n❌ Xato: {failed}",
-            reply_markup=admin_keyboard()
-        )
-
-# ------------------------- CENTRAL TEXT HANDLER -------------------------
-
-@router.message(F.text)
-async def handle_text(message: Message):
-    text = (message.text or "").strip()
-    uid = message.from_user.id
-    mode = user_modes.get(uid)
-
-    # Kino qo‘shish wizard
-    upload = movie_uploads.get(uid)
-    if upload:
-        step = upload.get("step")
-        if step == "number":
-            if not text.isdigit() or int(text) < 1:
-                await message.answer("Musbat raqam yuboring. Masalan: 6")
-                return
-            upload["number"] = int(text)
-            upload["step"] = "title"
-            await message.answer("🎬 Kino nomini yuboring.")
-            return
-        if step == "title":
-            if not text or len(text) > 150:
-                await message.answer("Kino nomi 1–150 belgi bo‘lsin.")
-                return
-            upload["title"] = text
-            upload["step"] = "year"
-            await message.answer("📅 Kino yilini yuboring (masalan, 2026) yoki /skip yozing.")
-            return
-        if step == "year":
-            if text == "/skip":
-                upload["year"] = 0
-            elif text.isdigit() and 1888 <= int(text) <= 2100:
-                upload["year"] = int(text)
-            else:
-                await message.answer("Yilni 1888–2100 oralig‘ida kiriting yoki /skip yozing.")
-                return
-            upload["step"] = "language"
-            await message.answer("🌐 Kino tilini yozing (masalan, O‘zbek, Rus, Ingliz).")
-            return
-        if step == "language":
-            upload["language"] = "O‘zbek" if text == "/skip" else text[:40]
-            upload["step"] = "description"
-            await message.answer("📝 Tavsif yuboring yoki /skip yozing.")
-            return
-        if step == "description":
-            upload["description"] = "" if text == "/skip" else text[:800]
-            upload["step"] = "poster"
-            await message.answer("🖼 Poster rasmini yuboring yoki /skip yozing.")
-            return
-        if step == "poster":
-            if text == "/skip":
-                upload["poster_file_id"] = None
-                upload["step"] = "video"
-                await message.answer("🎞 Endi film videosini yuboring.")
-            else:
-                await message.answer("Poster rasmini yuboring yoki /skip yozing.")
-            return
-        if step == "video":
-            await message.answer("🎞 Kino videosini video yoki video fayl ko‘rinishida yuboring.")
-            return
-
-    if mode == "movie_search":
-        user_modes.pop(uid, None)
-        results = search_movies(text)
-        if not results:
-            await message.answer("😕 Bunday kino topilmadi.")
-            return
-        buttons = [[InlineKeyboardButton(text=f"🎬 {n}. {title[:45]}", callback_data=f"movie:{mid}")]
-                   for mid, n, title, desc in results]
-        await message.answer("🔎 Topilgan kinolar:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-        return
-
-    if mode in ("tts_male", "tts_female"):
-        await process_tts(message, text, mode)
-        return
-    if mode == "voice_choose":
-        await message.answer("Avval erkak yoki ayol ovozini tanlang.", reply_markup=voice_keyboard)
-        return
-
-    if mode == "link":
-        if not valid_video_url(text):
-            await message.answer("❌ HTTPS YouTube, Instagram yoki TikTok havolasini yuboring.")
-            return
-        status = await message.answer("⚡ Havoladagi video yuklanmoqda...")
-        try:
-            with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
-                async with VIDEO_SEMAPHORE:
-                    path = await download_public_link(text, Path(tmp))
-                    sent = await message.answer_video(FSInputFile(path), caption=f"✅ {detect_platform(text)} videosi tayyor!")
-                    if sent.video:
-                        save_user_video(uid, sent.video.file_id, "video", "Havoladan video")
-            await status.delete()
-            await message.answer("💾 Video «Mening videolarim» bo‘limiga saqlandi.")
-        except Exception as exc:
-            log.exception("Link video xatosi")
-            await status.edit_text(f"❌ Yuklab bo‘lmadi: {html.escape(str(exc)[:300])}")
-        finally:
-            user_modes.pop(uid, None)
-        return
-
-    if mode in ("round", "916"):
-        await message.answer("Iltimos, galereyadan video yuboring.")
-        return
-
-    # Oddiy raqam yuborilsa ham kino izlash
-    if text.isdigit():
-        results = search_movies(text)
-        if results:
-            buttons = [[InlineKeyboardButton(text=f"🎬 {n}. {title[:45]}", callback_data=f"movie:{mid}")]
-                       for mid, n, title, desc in results]
-            await message.answer("🎬 Kino topildi:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-            return
-
-    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=menu_for(uid))
-
-# ------------------------- MEDIA HANDLER -------------------------
+async def poster_handler(m:Message):
+    u=uploads.get(m.from_user.id)
+    if not u or u.get('step')!='poster': return
+    u['poster']=m.photo[-1].file_id; await create_catalog_record(m,u)
 
 @router.message(F.video | F.document)
-async def handle_video_or_document(message: Message):
-    uid = message.from_user.id
-    upload = movie_uploads.get(uid)
-
-    # Admin kino qo‘shish bosqichi
-    if upload and upload.get("step") == "video":
-        info = get_video_info(message)
-        if not info:
-            await message.answer("❌ Video fayl yuboring. Fayl turi video/mp4 bo‘lishi kerak.")
-            return
-        file_id, size, duration, media_type = info
-        try:
-            save_movie(
-                upload["number"], upload["title"], upload.get("description", ""),
-                file_id, media_type, upload.get("poster_file_id"),
-                upload.get("year", 0), upload.get("language", "O‘zbek")
-            )
-            number, title = upload["number"], upload["title"]
-            movie_uploads.pop(uid, None)
-            await message.answer(
-                f"✅ <b>Kino saqlandi!</b>\n🔢 Kodi: {number}\n🎬 Nomi: {html.escape(title)}\n📅 Yili: {upload.get('year', 0) or 'Ko‘rsatilmagan'}\n🌐 Tili: {html.escape(upload.get('language', 'O‘zbek'))}",
-                reply_markup=admin_keyboard()
-            )
-        except Exception:
-            log.exception("Movie DB save failed")
-            await message.answer("❌ Kino bazaga saqlanmadi.")
+async def media_handler(m:Message):
+    uid=m.from_user.id; u=uploads.get(uid)
+    if u and u.get('step')=='media':
+        info=get_video_info(m)
+        if not info: await m.answer('❌ Video fayl yuboring.'); return
+        fid,size,dur,typ=info
+        if size and size>MAX_UPLOAD: await m.answer('❌ Video 20 MB dan katta.'); return
+        if u['kind']=='movie' and u['count']>=1: await m.answer('Bu bittalik kino. Bitta video yetarli.'); return
+        num=u['count']+1
+        with db() as c: c.execute('INSERT INTO episodes(catalog_id,episode_number,file_id,media_type) VALUES(?,?,?,?)',(u['catalog_id'],num,fid,typ))
+        u['count']=num
+        if u['kind']=='movie':
+            uploads.pop(uid,None); await m.answer(f"✅ Bittalik kino saqlandi!\n🎬 {html.escape(u['title'])}\n🔢 Kod: {u['code']}",reply_markup=menu_for(uid))
+        else: await m.answer(f'✅ {num}-qism saqlandi. Keyingi qismni yuboring yoki /doneepisodes yozing.')
         return
-
-    mode = user_modes.get(uid)
-    if mode not in ("round", "916"):
-        await message.answer("Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang.")
-        return
-    if not get_video_info(message):
-        await message.answer("Video fayl yuboring.")
-        return
-    await process_uploaded_video(message, mode)
-
-# ------------------------- FALLBACK -------------------------
+    mode=user_modes.get(uid)
+    if mode in ('round','916'):
+        if not get_video_info(m): await m.answer('Video yuboring.'); return
+        await process_format(m,mode); return
+    await m.answer('Avval menyudan kerakli bo‘limni tanlang.')
 
 @router.message()
-async def fallback(message: Message):
-    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=menu_for(message.from_user.id))
+async def fallback(m:Message): await m.answer('Menyudan kerakli funksiyani tanlang.',reply_markup=menu_for(m.from_user.id))
 
-# ------------------------- WEBHOOK -------------------------
-
-async def on_startup(app: web.Application):
-    init_db()
-    await bot.set_webhook(
-        f"{BASE_URL}/{WEBHOOK_PATH}",
-        secret_token=WEBHOOK_SECRET,
-        drop_pending_updates=True,
-        allowed_updates=dp.resolve_used_update_types()
-    )
-    log.info("ASAVED webhook o‘rnatildi.")
-
-async def on_shutdown(app: web.Application):
-    await bot.delete_webhook(drop_pending_updates=False)
-    await bot.session.close()
-
+# ===================== WEBHOOK =====================
+async def on_startup(app):
+    init_db(); await bot.set_webhook(f'{BASE_URL}/{WEBHOOK_PATH}',secret_token=WEBHOOK_SECRET,drop_pending_updates=True,allowed_updates=dp.resolve_used_update_types()); log.info('Webhook o‘rnatildi')
+async def on_shutdown(app): await bot.delete_webhook(drop_pending_updates=False); await bot.session.close()
 async def main():
-    init_db()
-    app = web.Application(client_max_size=2 * 1024 * 1024)
-    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
-    app.router.add_get("/health", lambda request: web.Response(text="ok"))
-    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(
-        app, path=f"/{WEBHOOK_PATH}"
-    )
-    setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_shutdown)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info("ASAVED port %s da ishga tushdi", PORT)
-    await asyncio.Event().wait()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    init_db(); app=web.Application(client_max_size=2*1024*1024); app.router.add_get('/',lambda r:web.Response(text='Kino Olami bot is running')); app.router.add_get('/health',lambda r:web.Response(text='ok'))
+    SimpleRequestHandler(dispatcher=dp,bot=bot,secret_token=WEBHOOK_SECRET).register(app,path=f'/{WEBHOOK_PATH}'); setup_application(app,dp,bot=bot); app.on_startup.append(on_startup); app.on_cleanup.append(on_shutdown)
+    runner=web.AppRunner(app); await runner.setup(); site=web.TCPSite(runner,'0.0.0.0',PORT); await site.start(); log.info('Server %s portda',PORT); await asyncio.Event().wait()
+if __name__=='__main__': asyncio.run(main())
