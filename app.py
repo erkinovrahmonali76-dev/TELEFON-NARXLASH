@@ -12,20 +12,25 @@ import html
 from typing import Any, Awaitable, Callable
 
 from aiohttp import web, ClientSession, ClientTimeout
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     Message, ReplyKeyboardMarkup, KeyboardButton,
-    ReplyKeyboardRemove, FSInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    FSInputFile, InlineKeyboardMarkup,
+    InlineKeyboardButton, CallbackQuery
 )
-from aiogram import BaseMiddleware
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.webhook.aiohttp_server import (
+    SimpleRequestHandler, setup_application
+)
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("asaved")
+
+# ==============================
+# SOZLAMALAR
+# ==============================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
@@ -33,19 +38,10 @@ WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-# IKKITA MAJBURIY KANAL
-REQUIRED_CHANNELS = [
-    {
-        "username": "@Asilbek_710LIVE",
-        "url": "https://t.me/Asilbek_710LIVE",
-        "title": "Asilbek 710 LIVE"
-    },
-    {
-        "username": "@ReklamaBozoriUzz",
-        "url": "https://t.me/ReklamaBozoriUzz",
-        "title": "Reklama Bozori Uzz"
-    }
-]
+# FAQAT BITTA MAJBURIY KANAL
+CHANNEL_USERNAME = "@kinoolamiuzzzz"
+CHANNEL_URL = "https://t.me/kinoolamiuzzzz"
+CHANNEL_TITLE = "🎬 Kino Olami"
 
 DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
 
@@ -73,6 +69,7 @@ if not WEBHOOK_SECRET or not re.fullmatch(
 if not BASE_URL:
     raise RuntimeError("RENDER_EXTERNAL_URL topilmadi")
 
+
 bot = Bot(
     BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -81,6 +78,11 @@ bot = Bot(
 dp = Dispatcher()
 router = Router()
 dp.include_router(router)
+
+
+# ==============================
+# TUGMALAR
+# ==============================
 
 BTN_ROUND = "🎥 Dumaloq video"
 BTN_LINK = "🔗 Video havolasi"
@@ -101,19 +103,13 @@ keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Kerakli funksiyani tanlang"
 )
 
-# IKKI KANAL UCHUN OBUNA TUGMALARI
+# FAQAT KINO OLAMI KANALI UCHUN TUGMA
 subscribe_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
             InlineKeyboardButton(
-                text="📢 1. Asilbek 710 LIVE",
-                url="https://t.me/Asilbek_710LIVE"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text="📢 2. Reklama Bozori Uzz",
-                url="https://t.me/ReklamaBozoriUzz"
+                text="🎬 Kino Olami kanaliga obuna bo‘lish",
+                url=CHANNEL_URL
             )
         ],
         [
@@ -125,6 +121,25 @@ subscribe_keyboard = InlineKeyboardMarkup(
     ]
 )
 
+voice_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(text=BTN_MALE),
+            KeyboardButton(text=BTN_FEMALE)
+        ],
+        [
+            KeyboardButton(text="⬅️ Asosiy menyu")
+        ],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Ovoz turini tanlang"
+)
+
+
+# ==============================
+# UMUMIY SOZLAMALAR
+# ==============================
+
 user_modes: dict[int, str] = {}
 subscription_cache: dict[int, float] = {}
 
@@ -135,6 +150,7 @@ TTS_SEMAPHORE = asyncio.Semaphore(2)
 MAX_TTS_CHARS = 3000
 
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+
 TTS_MODEL_ID = os.getenv(
     "ELEVENLABS_MODEL_ID",
     "eleven_multilingual_v2"
@@ -170,6 +186,10 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 
+
+# ==============================
+# DATABASE
+# ==============================
 
 def init_user_db():
     db_file = Path(DB_PATH)
@@ -253,6 +273,10 @@ async def send_ad_once(chat_id: int, user_id: int):
             conn.commit()
 
 
+# ==============================
+# ASOSIY MENYU
+# ==============================
+
 def main_text() -> str:
     return (
         "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
@@ -264,7 +288,23 @@ def main_text() -> str:
     )
 
 
-# IKKALA KANALNI TEKSHIRISH
+def admin_reply_keyboard() -> ReplyKeyboardMarkup:
+    rows = [list(row) for row in keyboard.keyboard]
+
+    rows.append([
+        KeyboardButton(text=ADMIN_BROADCAST_BTN)
+    ])
+
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True
+    )
+
+
+# ==============================
+# KINO OLAMI OBUNASINI TEKSHIRISH
+# ==============================
+
 async def is_subscribed(
     user_id: int,
     use_cache: bool = True
@@ -277,50 +317,51 @@ async def is_subscribed(
     if use_cache and cached_until > now:
         return True
 
-    for channel in REQUIRED_CHANNELS:
-        try:
-            member = await bot.get_chat_member(
-                channel["username"],
-                user_id
-            )
+    try:
+        member = await bot.get_chat_member(
+            CHANNEL_USERNAME,
+            user_id
+        )
 
-            subscribed = member.status in {
-                ChatMemberStatus.MEMBER,
-                ChatMemberStatus.ADMINISTRATOR,
-                ChatMemberStatus.CREATOR,
-            }
+        subscribed = member.status in {
+            ChatMemberStatus.MEMBER,
+            ChatMemberStatus.ADMINISTRATOR,
+            ChatMemberStatus.CREATOR,
+        }
 
-            if not subscribed:
-                subscription_cache.pop(user_id, None)
-                return False
-
-        except Exception:
-            log.exception(
-                "Obunani tekshirishda xatolik: %s",
-                channel["username"]
-            )
-
+        if not subscribed:
             subscription_cache.pop(user_id, None)
             return False
 
-    subscription_cache[user_id] = (
-        now + SUBSCRIPTION_CACHE_SECONDS
-    )
+        subscription_cache[user_id] = (
+            now + SUBSCRIPTION_CACHE_SECONDS
+        )
 
-    return True
+        return True
+
+    except Exception:
+        log.exception(
+            "Kino Olami kanalida obunani tekshirishda xatolik"
+        )
+
+        subscription_cache.pop(user_id, None)
+        return False
 
 
 async def send_subscription_required(message: Message):
     await message.answer(
         "⛔ <b>ASAVED botidan foydalanish uchun "
-        "ikkala kanalga ham obuna bo‘lishingiz kerak!</b>\n\n"
-        "1️⃣ Asilbek 710 LIVE\n"
-        "2️⃣ Reklama Bozori Uzz\n\n"
-        "Ikkala kanalga obuna bo‘lgach, "
-        "«✅ Obunani tekshirish» tugmasini bosing.",
+        "Kino Olami kanaliga obuna bo‘lishingiz kerak!</b>\n\n"
+        "1️⃣ 🎬 Kino Olami kanaliga kiring.\n"
+        "2️⃣ Obuna bo‘ling.\n"
+        "3️⃣ «✅ Obunani tekshirish» tugmasini bosing.",
         reply_markup=subscribe_keyboard
     )
 
+
+# ==============================
+# OBUNA MIDDLEWARE
+# ==============================
 
 class SubscriptionMiddleware(BaseMiddleware):
 
@@ -336,12 +377,11 @@ class SubscriptionMiddleware(BaseMiddleware):
 
         register_user(event.from_user.id)
 
+        # /myid komandasi obunadan mustasno
         if event.text and event.text.split()[0].split("@")[0] == "/myid":
             return await handler(event, data)
 
-        if event.from_user.id in ADMIN_IDS:
-            return await handler(event, data)
-
+        # BARCHA FOYDALANUVCHILAR, ADMINLAR HAM TEKSHIRILADI
         if await is_subscribed(event.from_user.id):
             await send_ad_once(
                 event.chat.id,
@@ -356,7 +396,10 @@ class SubscriptionMiddleware(BaseMiddleware):
 router.message.middleware(SubscriptionMiddleware())
 
 
+# ==============================
 # OBUNANI TEKSHIRISH TUGMASI
+# ==============================
+
 @router.callback_query(F.data == "check_subscription")
 async def check_subscription_callback(callback: CallbackQuery):
 
@@ -367,13 +410,11 @@ async def check_subscription_callback(callback: CallbackQuery):
     user_id = callback.from_user.id
     register_user(user_id)
 
-    if user_id in ADMIN_IDS:
-        subscribed = True
-    else:
-        subscribed = await is_subscribed(
-            user_id,
-            use_cache=False
-        )
+    # Har safar serverdan yangidan tekshiradi
+    subscribed = await is_subscribed(
+        user_id,
+        use_cache=False
+    )
 
     if subscribed:
 
@@ -383,7 +424,7 @@ async def check_subscription_callback(callback: CallbackQuery):
         )
 
         await callback.answer(
-            "✅ Ikkala kanalga obunangiz tasdiqlandi!"
+            "✅ Kino Olami kanaliga obunangiz tasdiqlandi!"
         )
 
         if callback.message:
@@ -404,24 +445,14 @@ async def check_subscription_callback(callback: CallbackQuery):
 
     else:
         await callback.answer(
-            "❌ Ikkala kanalga ham obuna bo‘ling!",
+            "❌ Avval Kino Olami kanaliga obuna bo‘ling!",
             show_alert=True
         )
 
 
-def admin_reply_keyboard() -> ReplyKeyboardMarkup:
-
-    rows = [list(row) for row in keyboard.keyboard]
-
-    rows.append([
-        KeyboardButton(text=ADMIN_BROADCAST_BTN)
-    ])
-
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True
-    )
-
+# ==============================
+# /MYID
+# ==============================
 
 @router.message(Command("myid"))
 async def show_my_id(message: Message):
@@ -433,6 +464,10 @@ async def show_my_id(message: Message):
             "Shu raqamni Render → Environment → ADMIN_IDS qiymatiga kiriting."
         )
 
+
+# ==============================
+# ADMIN PANEL
+# ==============================
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message):
@@ -549,6 +584,10 @@ async def admin_broadcast_confirm(callback: CallbackQuery):
         )
 
 
+# ==============================
+# START
+# ==============================
+
 @router.message(CommandStart())
 async def start(message: Message):
 
@@ -565,6 +604,10 @@ async def start(message: Message):
         reply_markup=reply_markup
     )
 
+
+# ==============================
+# VIDEO FUNKSIYALARINI TANLASH
+# ==============================
 
 @router.message(F.text == BTN_ROUND)
 async def choose_round(message: Message):
@@ -596,20 +639,9 @@ async def choose_link(message: Message):
     )
 
 
-voice_keyboard = ReplyKeyboardMarkup(
-    keyboard=[
-        [
-            KeyboardButton(text=BTN_MALE),
-            KeyboardButton(text=BTN_FEMALE)
-        ],
-        [
-            KeyboardButton(text="⬅️ Asosiy menyu")
-        ],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Ovoz turini tanlang"
-)
-
+# ==============================
+# TTS TANLASH
+# ==============================
 
 @router.message(F.text == BTN_TTS)
 async def choose_tts(message: Message):
@@ -667,6 +699,10 @@ async def back_to_menu(message: Message):
         )
     )
 
+
+# ==============================
+# ELEVENLABS TTS
+# ==============================
 
 async def text_to_speech(
     text: str,
@@ -804,6 +840,10 @@ async def process_tts(
         user_modes.pop(message.from_user.id, None)
 
 
+# ==============================
+# VIDEO YUKLASH
+# ==============================
+
 def get_video_info(message: Message):
 
     if message.video:
@@ -861,6 +901,10 @@ async def download_telegram_video(
 
     return target, duration
 
+
+# ==============================
+# FFMPEG
+# ==============================
 
 async def run_ffmpeg(args: list[str]):
 
@@ -988,6 +1032,10 @@ async def process_uploaded_video(
         user_modes.pop(message.from_user.id, None)
 
 
+# ==============================
+# VIDEO HAVOLASINI TEKSHIRISH
+# ==============================
+
 def valid_video_url(raw: str) -> bool:
 
     try:
@@ -1019,6 +1067,10 @@ def detect_platform(url: str) -> tuple[str, str]:
 
     return "youtube", "YouTube"
 
+
+# ==============================
+# YOUTUBE / INSTAGRAM / TIKTOK
+# ==============================
 
 async def download_public_link(
     url: str,
@@ -1091,6 +1143,10 @@ async def download_public_link(
 
     return result
 
+
+# ==============================
+# MATNLARNI QAYTA ISHLASH
+# ==============================
 
 @router.message(F.text)
 async def handle_text(message: Message):
@@ -1187,6 +1243,10 @@ async def handle_text(message: Message):
         )
 
 
+# ==============================
+# VIDEO FAYLNI QABUL QILISH
+# ==============================
+
 @router.message(F.video | F.document)
 async def handle_video(message: Message):
 
@@ -1212,6 +1272,10 @@ async def handle_video(message: Message):
     )
 
 
+# ==============================
+# BOSHQA XABARLAR
+# ==============================
+
 @router.message()
 async def fallback(message: Message):
 
@@ -1224,6 +1288,10 @@ async def fallback(message: Message):
         )
     )
 
+
+# ==============================
+# WEBHOOK
+# ==============================
 
 async def on_startup():
 
