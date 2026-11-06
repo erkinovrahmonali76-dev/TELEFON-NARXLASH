@@ -1,4 +1,3 @@
-aiogram>=3.13,<4
+aiogram==3.13.1
 aiohttp
-livekit-api
 yt-dlp
