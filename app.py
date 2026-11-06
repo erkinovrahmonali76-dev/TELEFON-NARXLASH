@@ -1,875 +1,762 @@
 import asyncio
-import hashlib
-import hmac
-import json
 import logging
 import os
-import shutil
+import re
 import sqlite3
 import tempfile
-import time
-import secrets
-from datetime import timedelta
 from pathlib import Path
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import urlparse
+import html
 
-import aiohttp
-import yt_dlp
-from aiohttp import web
-from aiogram import Bot, Dispatcher, F
-from aiogram.enums import ChatMemberStatus
+from typing import Any, Awaitable, Callable
+
+from aiohttp import web, ClientSession, ClientTimeout
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo, FSInputFile
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    Video, Document, ReplyKeyboardRemove, FSInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
+from aiogram import BaseMiddleware
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from livekit import api
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("asaved")
 
-# =========================================================
-# ASAVED SOZLAMALARI
-# =========================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
+PORT = int(os.getenv("PORT", "10000"))
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 CHANNEL_USERNAME = "@ReklamaBozoriUzz"
 CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "").strip()
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "").strip()
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "").strip()
-MINI_APP_URL = os.getenv("MINI_APP_URL", f"{BASE_URL}/chat").strip()
+# SQLite bazasi. Render Persistent Disk ishlatilsa DB_PATH=/var/data/asaved_users.db qiling.
+DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
 
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
-ELEVENLABS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
-MALE_VOICE_ID = os.getenv("MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip()
-FEMALE_VOICE_ID = os.getenv("FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip()
-
-ADMIN_IDS = {
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "")).split(",")
-    if x.strip().isdigit()
-}
-
-DB_PATH = os.getenv("DB_PATH", "").strip() or "asaved_users.db"
-MAX_VIDEO_MB = 20
-MAX_OUTPUT_MB = 49
-MAX_DURATION = 600
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
+# Har bir foydalanuvchiga bir marta yuboriladigan reklama xabari.
+AD_TEXT = (
+    "🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\n"
+    "Telegram kanalingiz rivojlanishini, yangi obunachilar e’tiboriga tushishini "
+    "xohlaysizmi? Unda ASAVED orqali reklama imkoniyatidan foydalaning!\n\n"
+    "📣 <b>Biz nima taklif qilamiz?</b>\n"
+    "• Telegram kanalingizni ASAVED bot foydalanuvchilariga tanitish\n"
+    "• Loyihangiz haqida ko‘proq insonlarga ma’lumot yetkazish\n"
+    "• Reklama bo‘yicha siz bilan kelishilgan holda ishlash\n\n"
+    "✨ <b>Reklama joylashtirish uchun hoziroq bog‘laning!</b>\n\n"
+    "👤 Admin: @akramovx7\n"
+    '💬 <a href="https://t.me/akramovx7">Murojaat qilish</a>'
 )
-logger = logging.getLogger("ASAVED")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN Render Environment'da sozlanmagan.")
-if not BASE_URL.startswith("https://"):
-    raise RuntimeError("RENDER_EXTERNAL_URL https:// bilan boshlanishi kerak.")
-if not MINI_APP_URL.startswith("https://"):
-    raise RuntimeError("MINI_APP_URL https:// bilan boshlanishi kerak.")
+    raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
+if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
+    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin; faqat harf, raqam, _ yoki - ishlating")
+if not BASE_URL:
+    raise RuntimeError("RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring")
 
-bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-video_modes = {}
-link_pending = set()
-tts_pending = set()
-tts_text = {}
-bot_username = ""
+BTN_ROUND = "🎥 Dumaloq video"
+BTN_LINK = "🔗 Video havolasi"
+BTN_916 = "📱 9:16 format"
+BTN_TTS = "🎙️ Matnni ovozga aylantirish"
+BTN_MALE = "👨 Erkak ovozi"
+BTN_FEMALE = "👩 Ayol ovozi"
 
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
+        [KeyboardButton(text=BTN_LINK)],
+        [KeyboardButton(text=BTN_TTS)],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Kerakli funksiyani tanlang"
+)
 
-# =========================================================
-# DATABASE
-# =========================================================
-def connect_db():
-    # Render konteynerida DB papkasi mavjud va yozish mumkin bo‘lishini ta'minlaymiz.
-    db_file = Path(DB_PATH).expanduser()
-    if db_file.parent != Path("."):
-        db_file.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(db_file), timeout=30)
-    con.row_factory = sqlite3.Row
-    return con
-
-
-def init_db():
-    con = connect_db()
-    con.executescript("""
-    CREATE TABLE IF NOT EXISTS bot_users (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        first_name TEXT,
-        created_at INTEGER
-    );
-
-    CREATE TABLE IF NOT EXISTS chat_sessions (
-        user_id INTEGER PRIMARY KEY,
-        status TEXT NOT NULL,
-        room_name TEXT,
-        updated_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS chat_invites (
-        code TEXT PRIMARY KEY,
-        room_name TEXT NOT NULL,
-        owner_id INTEGER NOT NULL,
-        joined_by INTEGER,
-        created_at INTEGER NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS chat_reports (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        reporter_id INTEGER,
-        reported_id INTEGER,
-        room_name TEXT,
-        reason TEXT,
-        created_at INTEGER
-    );
-    """)
-    con.commit()
-    con.close()
-
-
-def save_user(user):
-    if not user:
-        return
-    con = connect_db()
-    con.execute("""
-        INSERT INTO bot_users(user_id, username, first_name, created_at)
-        VALUES(?,?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-    """, (user.id, user.username or "", user.first_name or "", int(time.time())))
-    con.commit()
-    con.close()
-
-
-# =========================================================
-# OBUNA
-# =========================================================
-def subscribed_button():
-    return InlineKeyboardMarkup(inline_keyboard=[
+subscribe_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
         [InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=CHANNEL_URL)],
-        [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")]
-    ])
+        [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")],
+    ]
+)
+
+# Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
+user_modes: dict[int, str] = {}
+subscription_cache: dict[int, float] = {}
+SUBSCRIPTION_CACHE_SECONDS = 30
+VIDEO_SEMAPHORE = asyncio.Semaphore(2)
+TTS_SEMAPHORE = asyncio.Semaphore(2)
+MAX_TTS_CHARS = 3000
+
+# ElevenLabs tayyor (premade) ovozlari.
+ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+TTS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
+TTS_VOICES = {
+    "male": os.getenv("ELEVENLABS_MALE_VOICE_ID", "pNInz6obpgDQGcFmaJgB").strip(),
+    "female": os.getenv("ELEVENLABS_FEMALE_VOICE_ID", "21m00Tcm4TlvDq8ikWAM").strip(),
+}
+
+ALLOWED_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+    "instagram.com", "www.instagram.com",
+    "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com",
+}
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_OUTPUT_BYTES = 49 * 1024 * 1024
+MAX_LINK_BYTES = 49 * 1024 * 1024
+MAX_SECONDS = 600
+
+# Admin Telegram ID raqamlari: Render Environment -> ADMIN_IDS=123456789,987654321
+_admin_ids_raw = os.getenv("ADMIN_IDS", "") or os.getenv("ADMIN_ID", "")
+ADMIN_IDS = {int(x.strip()) for x in _admin_ids_raw.replace(";", ",").split(",") if x.strip().isdigit()}
+ADMIN_BROADCAST_BTN = "📢 Reklamani hammaga yuborish"
 
 
-async def is_subscribed(user_id):
+def init_user_db():
+    """Reklama yuborilgan Telegram foydalanuvchilarini SQLite'da saqlaydi."""
+    db_file = Path(DB_PATH)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ad_sent_users (
+                user_id INTEGER PRIMARY KEY,
+                sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_users (
+                user_id INTEGER PRIMARY KEY,
+                first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Avvalgi versiyada reklama olgan foydalanuvchilarni ham umumiy ro‘yxatga qo‘shamiz.
+        conn.execute("""
+            INSERT OR IGNORE INTO bot_users (user_id)
+            SELECT user_id FROM ad_sent_users
+        """)
+        conn.commit()
+
+
+def register_user(user_id: int):
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("""
+            INSERT INTO bot_users (user_id) VALUES (?)
+            ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP
+        """, (user_id,))
+        conn.commit()
+
+
+def get_all_user_ids() -> list[int]:
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        rows = conn.execute("SELECT user_id FROM bot_users").fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def mark_ad_sent_once(user_id: int) -> bool:
+    """
+    Foydalanuvchi uchun reklama yuborilganini belgilaydi.
+    True — birinchi marta, False — avval yuborilgan.
+    """
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        cursor = conn.execute(
+            "INSERT OR IGNORE INTO ad_sent_users (user_id) VALUES (?)",
+            (user_id,)
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+
+
+async def send_ad_once(chat_id: int, user_id: int):
+    """Har bir foydalanuvchiga reklama xabarini faqat bir marta yuboradi."""
+    try:
+        if not mark_ad_sent_once(user_id):
+            return
+
+        await bot.send_message(chat_id, AD_TEXT, disable_web_page_preview=True)
+        log.info("Reklama xabari yuborildi: user_id=%s", user_id)
+
+    except Exception:
+        # Xabar yuborilmasa, keyingi murojaatida qayta urinib ko'rish uchun
+        # bazadagi belgi olib tashlanadi.
+        log.exception("Reklama xabarini yuborishda xatolik: user_id=%s", user_id)
+        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+            conn.execute("DELETE FROM ad_sent_users WHERE user_id = ?", (user_id,))
+            conn.commit()
+
+
+def main_text() -> str:
+    return (
+        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
+        "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
+        "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
+        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
+        "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
+        "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
+    )
+
+
+async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
+    now = asyncio.get_running_loop().time()
+    cached_until = subscription_cache.get(user_id, 0)
+    if use_cache and cached_until > now:
+        return True
     try:
         member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        return member.status in (
+        subscribed = member.status in {
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
-            ChatMemberStatus.CREATOR
-        )
+            ChatMemberStatus.CREATOR,
+        }
+        if subscribed:
+            subscription_cache[user_id] = now + SUBSCRIPTION_CACHE_SECONDS
+        else:
+            subscription_cache.pop(user_id, None)
+        return subscribed
     except Exception:
-        logger.exception("Obuna tekshirishda xato. Bot kanal adminligini tekshiring.")
+        log.exception("Kanal obunasini tekshirishda xatolik")
         return False
 
 
-async def ask_sub(message):
+async def send_subscription_required(message: Message):
     await message.answer(
-        "Botdan foydalanish uchun quyidagi kanalga obuna bo‘ling:",
-        reply_markup=subscribed_button()
+        "⛔ Botdan foydalanish uchun avval kanalimizga obuna bo‘ling.\n"
+        "Obuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.",
+        reply_markup=subscribe_keyboard,
     )
 
 
-# =========================================================
-# KLAVIATURALAR
-# =========================================================
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🎥 Dumaloq video"), KeyboardButton(text="📱 9:16 format")],
-            [KeyboardButton(text="🔗 Video havolasi"), KeyboardButton(text="🎙️ Matnni ovozga aylantirish")]
-        ],
-        resize_keyboard=True
-    )
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: dict[str, Any],
+    ) -> Any:
+        if not event.from_user:
+            return await handler(event, data)
+
+        register_user(event.from_user.id)
+
+        # Telegram ID ni tekshirish uchun /myid buyrug'i obunasiz ham ishlaydi.
+        if event.text and event.text.split()[0].split("@")[0] == "/myid":
+            return await handler(event, data)
+
+        # Admin bot funksiyalaridan obunasiz ham foydalana oladi.
+        if event.from_user.id in ADMIN_IDS:
+            return await handler(event, data)
+
+        if await is_subscribed(event.from_user.id):
+            # Obunasi bor foydalanuvchiga reklama faqat bir marta yuboriladi.
+            await send_ad_once(event.chat.id, event.from_user.id)
+            return await handler(event, data)
+
+        await send_subscription_required(event)
+        return None
 
 
-def chat_inline_keyboard(url=None):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🌐 ASAVED CHAT", web_app=WebAppInfo(url=url or MINI_APP_URL))
-    ]])
+router.message.middleware(SubscriptionMiddleware())
 
 
-def tts_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="👨 Erkak ovozi", callback_data="tts:male"),
-        InlineKeyboardButton(text="👩 Ayol ovozi", callback_data="tts:female")
-    ]])
-
-
-# =========================================================
-# START
-# =========================================================
-@dp.message(CommandStart())
-async def start(message: Message):
-    save_user(message.from_user)
-    if not await is_subscribed(message.from_user.id):
-        await ask_sub(message)
+@router.callback_query(F.data == "check_subscription")
+async def check_subscription_callback(callback: CallbackQuery):
+    if not callback.from_user:
+        await callback.answer()
         return
 
-    args = (message.text or "").split(maxsplit=1)
-    payload = args[1].strip() if len(args) > 1 else ""
-    if payload.startswith("invite_"):
-        code = payload[len("invite_"):]
-        await message.answer(
-            "Sizga ASAVED CHAT taklifi yuborildi. Suhbatga kirish uchun tugmani bosing:",
-            reply_markup=chat_inline_keyboard(f"{MINI_APP_URL}?invite={code}")
+    register_user(callback.from_user.id)
+
+    if callback.from_user.id in ADMIN_IDS or await is_subscribed(callback.from_user.id, use_cache=False):
+        await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
+        if callback.message:
+            # Yangi obuna bo'lgan foydalanuvchiga ham reklama bir marta yuboriladi.
+            await send_ad_once(callback.message.chat.id, callback.from_user.id)
+            await callback.message.answer(main_text(), reply_markup=admin_reply_keyboard() if callback.from_user.id in ADMIN_IDS else keyboard)
+    else:
+        await callback.answer(
+            "❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!",
+            show_alert=True,
         )
-        return
 
+
+def admin_reply_keyboard() -> ReplyKeyboardMarkup:
+    rows = [list(row) for row in keyboard.keyboard]
+    rows.append([KeyboardButton(text=ADMIN_BROADCAST_BTN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
+
+
+@router.message(Command("myid"))
+async def show_my_id(message: Message):
+    if message.from_user:
+        await message.answer(
+            f"🆔 Sizning Telegram ID raqamingiz: <code>{message.from_user.id}</code>\n\n"
+            "Shu raqamni Render → Environment → ADMIN_IDS qiymatiga kiriting."
+        )
+
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Sizda admin huquqi yo‘q.")
+        return
     await message.answer(
-        "👋 ASAVED botiga xush kelibsiz!\n\nKerakli xizmatni tanlang:",
-        reply_markup=main_keyboard()
+        "🛠 <b>Admin panel</b>\\n\\n"
+        f"👥 Bazadagi foydalanuvchilar: <b>{len(get_all_user_ids())}</b>\\n"
+        "Reklamani hammaga yuborish uchun quyidagi tugmani bosing.",
+        reply_markup=admin_reply_keyboard()
     )
-    await message.answer("🌐 Video suhbat uchun Mini App'ni oching:", reply_markup=chat_inline_keyboard())
 
 
-@dp.callback_query(F.data == "check_subscription")
-async def check_subscription(call: CallbackQuery):
-    if await is_subscribed(call.from_user.id):
-        save_user(call.from_user)
-        await call.message.answer("✅ Obuna tasdiqlandi!", reply_markup=main_keyboard())
-        await call.message.answer("🌐 Video suhbat uchun Mini App'ni oching:", reply_markup=chat_inline_keyboard())
-        await call.answer("Obuna tasdiqlandi.")
-    else:
-        await call.answer("Avval @ReklamaBozoriUzz kanaliga obuna bo‘ling.", show_alert=True)
-
-
-# =========================================================
-# VIDEO FUNKSIYALARI
-# =========================================================
-@dp.message(F.text == "🎥 Dumaloq video")
-async def round_start(message: Message):
-    if not await is_subscribed(message.from_user.id):
-        await ask_sub(message)
+@router.message(F.text == ADMIN_BROADCAST_BTN)
+async def admin_broadcast_start(message: Message):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
         return
-    video_modes[message.from_user.id] = "round"
-    await message.answer("🎥 Dumaloq videoga aylantirmoqchi bo‘lgan videoni yuboring.")
+    total = len(get_all_user_ids())
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Ha, hammaga yuborish", callback_data="admin_broadcast_confirm")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_broadcast_cancel")],
+    ])
+    await message.answer(
+        f"📢 Reklama <b>{total}</b> ta saqlangan foydalanuvchiga yuboriladi.\\n"
+        "Har bir bosishda reklama yana qayta yuboriladi. Davom etasizmi?",
+        reply_markup=confirm_kb
+    )
 
 
-@dp.message(F.text == "📱 9:16 format")
-async def vertical_start(message: Message):
-    if not await is_subscribed(message.from_user.id):
-        await ask_sub(message)
+@router.callback_query(F.data == "admin_broadcast_cancel")
+async def admin_broadcast_cancel(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
         return
-    video_modes[message.from_user.id] = "vertical"
-    await message.answer("📱 9:16 formatga aylantirish uchun videoni yuboring.")
+    await callback.answer("Bekor qilindi.")
+    if callback.message:
+        await callback.message.edit_text("❌ Reklama yuborish bekor qilindi.")
 
 
-@dp.message(F.text == "🔗 Video havolasi")
-async def link_start(message: Message):
-    if not await is_subscribed(message.from_user.id):
-        await ask_sub(message)
+@router.callback_query(F.data == "admin_broadcast_confirm")
+async def admin_broadcast_confirm(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Ruxsat yo‘q.", show_alert=True)
         return
-    link_pending.add(message.from_user.id)
-    await message.answer("YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
+    await callback.answer("Yuborish boshlandi.")
+    if callback.message:
+        await callback.message.edit_text("⏳ Reklama foydalanuvchilarga yuborilmoqda...")
+
+    user_ids = get_all_user_ids()
+    sent = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            await bot.send_message(user_id, AD_TEXT, disable_web_page_preview=True)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            log.info("Broadcast yuborilmadi user_id=%s: %s", user_id, exc)
+        await asyncio.sleep(0.05)
+
+    report = (
+        "✅ <b>Reklama yuborish yakunlandi!</b>\\n\\n"
+        f"👥 Jami ro‘yxatda: <b>{len(user_ids)}</b>\\n"
+        f"✅ Muvaffaqiyatli: <b>{sent}</b>\\n"
+        f"❌ Yuborilmadi: <b>{failed}</b>"
+    )
+    if callback.message:
+        await callback.message.answer(report, reply_markup=admin_reply_keyboard())
 
 
-@dp.message(F.text == "🎙️ Matnni ovozga aylantirish")
-async def tts_start(message: Message):
-    if not await is_subscribed(message.from_user.id):
-        await ask_sub(message)
+@router.message(CommandStart())
+async def start(message: Message):
+    user_modes.pop(message.from_user.id, None)
+    reply_markup = admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
+    await message.answer(main_text(), reply_markup=reply_markup)
+
+
+@router.message(F.text == BTN_ROUND)
+async def choose_round(message: Message):
+    user_modes[message.from_user.id] = "round"
+    await message.answer("🎥 Endi galereyadan 60 soniyagacha video yuboring.")
+
+
+@router.message(F.text == BTN_916)
+async def choose_916(message: Message):
+    user_modes[message.from_user.id] = "916"
+    await message.answer("📱 Endi 9:16 formatga o‘tkazish uchun videoni yuboring.")
+
+
+@router.message(F.text == BTN_LINK)
+async def choose_link(message: Message):
+    user_modes[message.from_user.id] = "link"
+    await message.answer("🔗 YouTube, Instagram yoki TikTok video havolasini yuboring.")
+
+
+voice_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=BTN_MALE), KeyboardButton(text=BTN_FEMALE)],
+        [KeyboardButton(text="⬅️ Asosiy menyu")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Ovoz turini tanlang"
+)
+
+
+@router.message(F.text == BTN_TTS)
+async def choose_tts(message: Message):
+    user_modes[message.from_user.id] = "voice_choose"
+    await message.answer(
+        "🎙️ Qaysi ElevenLabs ovozida matnni MP3 qilamiz?\n\n"
+        "Bu tayyor AI ovozlari; ovoz namunasi yoki voice-cloning ishlatilmaydi.",
+        reply_markup=voice_keyboard
+    )
+
+
+@router.message(F.text == BTN_MALE)
+async def choose_tts_male(message: Message):
+    user_modes[message.from_user.id] = "tts_male"
+    await message.answer(
+        "👨 Erkak ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.",
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
+    )
+
+
+@router.message(F.text == BTN_FEMALE)
+async def choose_tts_female(message: Message):
+    user_modes[message.from_user.id] = "tts_female"
+    await message.answer(
+        "👩 Ayol ovozi tanlandi. Endi ovozga aylantiriladigan matnni yuboring.",
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
+    )
+
+
+@router.message(F.text == "⬅️ Asosiy menyu")
+async def back_to_menu(message: Message):
+    user_modes.pop(message.from_user.id, None)
+    await message.answer(main_text(), reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+
+
+async def text_to_speech(text: str, voice_id: str, destination: Path):
+    """ElevenLabs'ning tayyor ovozida matnni MP3 ga aylantiradi."""
+    if not ELEVENLABS_API_KEY:
+        raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY topilmadi")
+
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": TTS_MODEL_ID,
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.75,
+        },
+    }
+    timeout = ClientTimeout(total=120, connect=20)
+    async with ClientSession(timeout=timeout) as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            if response.status != 200:
+                detail = (await response.text())[:500]
+                log.error("ElevenLabs API xatosi: status=%s, body=%s", response.status, detail)
+                if response.status == 401:
+                    raise RuntimeError("ElevenLabs API kaliti noto‘g‘ri yoki faol emas")
+                if response.status == 429:
+                    raise RuntimeError("ElevenLabs limiti yoki kreditlari tugagan bo‘lishi mumkin")
+                raise RuntimeError(f"ElevenLabs API xatosi ({response.status})")
+            audio_data = await response.read()
+
+    if not audio_data:
+        raise RuntimeError("ElevenLabs bo‘sh audio qaytardi")
+    destination.write_bytes(audio_data)
+
+
+async def process_tts(message: Message, text: str, mode: str):
+    if len(text) > MAX_TTS_CHARS:
+        await message.answer(f"Matn juda uzun. Eng ko‘pi {MAX_TTS_CHARS} ta belgi yuboring.")
         return
-    tts_pending.add(message.from_user.id)
-    await message.answer("Ovozga aylantiriladigan matnni yuboring. Maksimum 3000 belgi.")
-
-
-async def download_telegram_video(message):
-    media = message.video
-    if not media and message.document:
-        if not (message.document.mime_type or "").startswith("video/"):
-            return None
-        media = message.document
-    if not media:
-        return None
-    if media.file_size and media.file_size > MAX_VIDEO_MB * 1024 * 1024:
-        await message.answer(f"Video {MAX_VIDEO_MB} MB dan kichik bo‘lishi kerak.")
-        return None
-
-    info = await bot.get_file(media.file_id)
-    folder = tempfile.mkdtemp(prefix="asaved_")
-    source = os.path.join(folder, "input.mp4")
+    if not text.strip():
+        await message.answer("Ovozga aylantirish uchun matn yuboring.")
+        return
+    voice_key = "male" if mode == "tts_male" else "female"
+    voice = TTS_VOICES[voice_key]
+    status = await message.answer("🎙️ Matn ovozga aylantirilmoqda...")
     try:
-        await bot.download_file(info.file_path, destination=source)
+        async with TTS_SEMAPHORE:
+            with tempfile.TemporaryDirectory(prefix="asaved_tts_") as tmp:
+                audio_path = Path(tmp) / "asaved_voice.mp3"
+                await text_to_speech(text, voice, audio_path)
+                if not audio_path.exists() or audio_path.stat().st_size == 0:
+                    raise RuntimeError("Audio fayl yaratilmadi")
+                await message.answer_audio(
+                    FSInputFile(audio_path),
+                    title="ASAVED AI ovoz",
+                    caption=f"✅ Tayyor! {'Erkak' if voice_key == 'male' else 'Ayol'} AI ovozi"
+                )
+        await status.delete()
     except Exception:
-        shutil.rmtree(folder, ignore_errors=True)
-        raise
-    return folder, source
+        log.exception("TTS generation failed")
+        await status.edit_text("❌ Ovoz yaratishda xatolik bo‘ldi. Birozdan keyin qayta urinib ko‘ring.")
+    finally:
+        user_modes.pop(message.from_user.id, None)
 
 
-async def ffmpeg_convert(source, output, mode):
-    if mode == "round":
-        vf = "scale=720:720:force_original_aspect_ratio=increase,crop=720:720"
-    else:
-        vf = "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280"
+def get_video_info(message: Message):
+    if message.video:
+        return message.video.file_id, message.video.file_size, message.video.duration, "video.mp4"
+    if message.document and (message.document.mime_type or "").startswith("video/"):
+        return message.document.file_id, message.document.file_size, None, message.document.file_name or "video.mp4"
+    return None
 
+
+async def download_telegram_video(message: Message, target: Path) -> tuple[Path, int | None]:
+    info = get_video_info(message)
+    if not info:
+        raise ValueError("Video topilmadi. Iltimos, video fayl yuboring.")
+    file_id, size, duration, filename = info
+    if size and size > MAX_UPLOAD_BYTES:
+        raise ValueError("Video 20 MB dan katta. Telegram cloud Bot API getFile cheklovi sabab kichikroq video yuboring.")
+    if duration and duration > MAX_SECONDS:
+        raise ValueError("Video 10 daqiqadan uzun. Qisqaroq video yuboring.")
+    tg_file = await bot.get_file(file_id)
+    await bot.download_file(tg_file.file_path, destination=target)
+    return target, duration
+
+
+async def run_ffmpeg(args: list[str]):
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-y", "-i", source, "-vf", vf,
-        "-t", str(MAX_DURATION), "-c:v", "libx264",
-        "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-        output, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    _, err = await proc.communicate()
+    _, stderr = await proc.communicate()
     if proc.returncode != 0:
-        raise RuntimeError(err.decode(errors="ignore")[-1200:])
-    if os.path.getsize(output) > MAX_OUTPUT_MB * 1024 * 1024:
-        raise RuntimeError("Tayyor video 49 MB dan oshib ketdi.")
+        raise RuntimeError(stderr.decode("utf-8", "ignore")[-1200:] or "FFmpeg xatoligi")
 
 
-@dp.message(F.video | F.document)
-async def video_handler(message: Message):
-    uid = message.from_user.id
-    mode = video_modes.get(uid)
-    if not mode:
-        return
-    if not await is_subscribed(uid):
-        await ask_sub(message)
-        return
+async def make_round(src: Path, dst: Path):
+    await run_ffmpeg([
+        "-i", str(src),
+        "-t", "60",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2",
+        "-movflags", "+faststart", str(dst)
+    ])
 
-    status = await message.answer("⏳ Video yuklanmoqda...")
-    folder = None
+
+async def make_916(src: Path, dst: Path):
+    await run_ffmpeg([
+        "-i", str(src),
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "26",
+        "-c:a", "aac", "-b:a", "128k",
+        "-movflags", "+faststart", str(dst)
+    ])
+
+
+async def process_uploaded_video(message: Message, mode: str):
+    status = await message.answer("⚡ Video tezkor rejimda tayyorlanmoqda...")
     try:
-        data = await download_telegram_video(message)
-        if not data:
-            await status.delete()
-            return
-        folder, source = data
-        output = os.path.join(folder, "result.mp4")
-        await status.edit_text("⏳ Video tayyorlanmoqda...")
-        await ffmpeg_convert(source, output, mode)
-        if mode == "round":
-            await message.answer_video_note(FSInputFile(output))
-        else:
-            await message.answer_video(FSInputFile(output), caption="✅ 9:16 format tayyor!")
-        video_modes.pop(uid, None)
+        async with VIDEO_SEMAPHORE:
+            with tempfile.TemporaryDirectory(prefix="asaved_") as tmp:
+                folder = Path(tmp)
+                src = folder / "input_video"
+                dst = folder / "output.mp4"
+                await download_telegram_video(message, src)
+                if mode == "round":
+                    await make_round(src, dst)
+                    if dst.stat().st_size > MAX_OUTPUT_BYTES:
+                        raise ValueError("Tayyor video juda katta chiqdi. Qisqaroq video yuboring.")
+                    await message.answer_video_note(FSInputFile(dst))
+                else:
+                    await make_916(src, dst)
+                    if dst.stat().st_size > MAX_OUTPUT_BYTES:
+                        raise ValueError("Tayyor video 49 MB dan katta. Qisqaroq video yuboring.")
+                    await message.answer_video(FSInputFile(dst), caption="📱 9:16 format tayyor!")
         await status.delete()
     except Exception as exc:
-        logger.exception("Video konvertatsiya xatosi")
-        await status.edit_text(f"❌ Xatolik: {str(exc)[:500]}")
+        log.exception("Video processing failed")
+        await status.edit_text(f"❌ Xatolik: {html.escape(str(exc)[:700])}")
     finally:
-        if folder:
-            shutil.rmtree(folder, ignore_errors=True)
+        user_modes.pop(message.from_user.id, None)
 
 
-# =========================================================
-# VIDEO HAVOLASIDAN YUKLASH
-# =========================================================
-async def download_link(url, folder):
-    def worker():
-        opts = {
-            "outtmpl": os.path.join(folder, "download.%(ext)s"),
-            "format": "best[ext=mp4]/best",
-            "merge_output_format": "mp4",
-            "noplaylist": True,
-            "max_filesize": MAX_OUTPUT_MB * 1024 * 1024,
-            "quiet": True,
-            "no_warnings": True
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    await asyncio.to_thread(worker)
-    files = [os.path.join(folder, x) for x in os.listdir(folder) if x.startswith("download.")]
-    if not files:
-        raise RuntimeError("Video topilmadi.")
-    return files[0]
-
-
-def allowed_video_host(host):
-    host = (host or "").lower().split(":")[0]
-    return (
-        host == "youtube.com" or host.endswith(".youtube.com") or host == "youtu.be"
-        or host == "instagram.com" or host.endswith(".instagram.com")
-        or host == "tiktok.com" or host.endswith(".tiktok.com")
-    )
-
-
-@dp.message(F.text)
-async def text_handler(message: Message):
-    uid = message.from_user.id
-    value = (message.text or "").strip()
-
-    if uid in tts_pending:
-        if not value:
-            return
-        if len(value) > 3000:
-            await message.answer("Matn 3000 belgidan oshmasin.")
-            return
-        tts_pending.discard(uid)
-        tts_text[uid] = value
-        await message.answer("Qaysi ovoz kerak?", reply_markup=tts_keyboard())
-        return
-
-    if uid in link_pending:
-        link_pending.discard(uid)
-        parsed = urlparse(value)
-        if parsed.scheme not in ("https", "http") or not allowed_video_host(parsed.hostname):
-            await message.answer("❌ Faqat to‘g‘ri YouTube, Instagram yoki TikTok havolasini yuboring.")
-            return
-        folder = tempfile.mkdtemp(prefix="asaved_link_")
-        status = await message.answer("⏳ Video yuklanmoqda...")
-        try:
-            path = await download_link(value, folder)
-            if os.path.getsize(path) > MAX_OUTPUT_MB * 1024 * 1024:
-                raise RuntimeError("Video 49 MB dan katta.")
-            await message.answer_video(FSInputFile(path))
-            await status.delete()
-        except Exception as exc:
-            logger.exception("Video havolasini yuklash xatosi")
-            await status.edit_text(f"❌ Yuklab bo‘lmadi: {str(exc)[:500]}")
-        finally:
-            shutil.rmtree(folder, ignore_errors=True)
-
-
-# =========================================================
-# ELEVENLABS TTS
-# =========================================================
-@dp.callback_query(F.data.startswith("tts:"))
-async def tts_callback(call: CallbackQuery):
-    uid = call.from_user.id
-    text_value = tts_text.get(uid)
-    if not text_value:
-        await call.answer("Avval matn yuboring.", show_alert=True)
-        return
-    if not ELEVENLABS_API_KEY:
-        await call.answer("ElevenLabs API kaliti sozlanmagan.", show_alert=True)
-        return
-
-    voice_id = MALE_VOICE_ID if call.data == "tts:male" else FEMALE_VOICE_ID
-    await call.answer("Ovoz tayyorlanmoqda...")
-    endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "text": text_value,
-        "model_id": ELEVENLABS_MODEL_ID,
-        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-    }
-    path = None
+def valid_video_url(raw: str) -> bool:
     try:
-        timeout = aiohttp.ClientTimeout(total=120)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(endpoint, headers=headers, json=payload) as resp:
-                if resp.status != 200:
-                    raise RuntimeError((await resp.text())[:500])
-                audio = await resp.read()
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
-            f.write(audio)
-            path = f.name
-        await call.message.answer_audio(FSInputFile(path))
-        tts_text.pop(uid, None)
-    except Exception as exc:
-        logger.exception("TTS xatosi")
-        await call.message.answer(f"❌ Ovoz yaratilmadi: {str(exc)[:500]}")
-    finally:
-        if path and os.path.exists(path):
-            os.unlink(path)
-
-
-# =========================================================
-# ADMIN XABAR TARQATISH
-# =========================================================
-@dp.message(Command("broadcast"))
-async def broadcast(message: Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    text_value = (message.text or "").partition(" ")[2].strip()
-    if not text_value:
-        await message.answer("Foydalanish: /broadcast xabar matni")
-        return
-    con = connect_db()
-    users = con.execute("SELECT user_id FROM bot_users").fetchall()
-    con.close()
-    sent = 0
-    for row in users:
-        try:
-            await bot.send_message(row["user_id"], text_value)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-    await message.answer(f"✅ Xabar {sent} ta foydalanuvchiga yuborildi.")
-
-
-# =========================================================
-# MINI APP AUTH
-# =========================================================
-def validate_init_data(init_data):
-    if not init_data:
-        return None
-    try:
-        values = dict(parse_qsl(init_data, keep_blank_values=True))
-        received_hash = values.pop("hash", None)
-        if not received_hash:
-            return None
-        auth_date = int(values.get("auth_date", "0"))
-        if auth_date <= 0 or int(time.time()) - auth_date > 86400:
-            return None
-        check = "\n".join(f"{k}={v}" for k, v in sorted(values.items()))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
-        calculated = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calculated, received_hash):
-            return None
-        user = json.loads(values.get("user", "{}"))
-        return int(user["id"])
-    except Exception:
-        logger.exception("initData tekshirish xatosi")
-        return None
-
-
-async def api_user(request):
-    try:
-        body = await request.json()
-    except Exception:
-        raise web.HTTPBadRequest(text="JSON format talab qilinadi")
-    init_data = body.get("initData", "")
-    uid = validate_init_data(init_data)
-    if not uid:
-        raise web.HTTPUnauthorized(text="Telegram tasdiqlash xatosi. Bot ichidagi ASAVED CHAT tugmasidan oching.")
-    if not await is_subscribed(uid):
-        raise web.HTTPForbidden(text="@ReklamaBozoriUzz kanaliga obuna bo‘ling")
-    return uid
-
-
-# =========================================================
-# TAKLIF ASOSIDAGI 1-1 CHAT
-# =========================================================
-def get_session(uid):
-    con = connect_db()
-    row = con.execute("SELECT * FROM chat_sessions WHERE user_id=?", (uid,)).fetchone()
-    con.close()
-    return dict(row) if row else None
-
-
-def create_invite(uid):
-    con = connect_db()
-    now = int(time.time())
-    old = con.execute("SELECT room_name FROM chat_sessions WHERE user_id=?", (uid,)).fetchone()
-    if old:
-        con.execute("DELETE FROM chat_sessions WHERE room_name=?", (old["room_name"],))
-        con.execute("DELETE FROM chat_invites WHERE room_name=?", (old["room_name"],))
-    code = secrets.token_urlsafe(16)
-    room = "asaved_private_" + secrets.token_urlsafe(16)
-    con.execute(
-        "INSERT INTO chat_invites(code,room_name,owner_id,created_at) VALUES(?,?,?,?)",
-        (code, room, uid, now)
-    )
-    con.execute(
-        "INSERT OR REPLACE INTO chat_sessions(user_id,status,room_name,updated_at) VALUES(?,'ready',?,?)",
-        (uid, room, now)
-    )
-    con.commit()
-    con.close()
-    return code
-
-
-def join_invite(uid, code):
-    con = connect_db()
-    invite = con.execute("SELECT * FROM chat_invites WHERE code=?", (code,)).fetchone()
-    if not invite:
-        con.close()
-        return False, "Taklif topilmadi yoki bekor qilingan."
-    if invite["owner_id"] == uid:
-        con.close()
-        return False, "O‘z taklifingizga qo‘shila olmaysiz."
-    if invite["joined_by"] is not None:
-        con.close()
-        return False, "Bu taklifdan allaqachon foydalanilgan."
-    if int(time.time()) - invite["created_at"] > 86400:
-        con.execute("DELETE FROM chat_invites WHERE code=?", (code,))
-        con.commit()
-        con.close()
-        return False, "Taklif muddati tugagan."
-    room = invite["room_name"]
-    now = int(time.time())
-    con.execute(
-        "INSERT OR REPLACE INTO chat_sessions(user_id,status,room_name,updated_at) VALUES(?,'ready',?,?)",
-        (uid, room, now)
-    )
-    con.execute("UPDATE chat_invites SET joined_by=? WHERE code=? AND joined_by IS NULL", (uid, code))
-    con.commit()
-    con.close()
-    return True, "Taklif qabul qilindi."
-
-
-def livekit_ready():
-    return bool(LIVEKIT_URL and LIVEKIT_API_KEY and LIVEKIT_API_SECRET)
-
-
-async def api_invite(request):
-    uid = await api_user(request)
-    if not livekit_ready():
-        return web.json_response({"error": "LiveKit sozlamalari to‘liq emas."}, status=503)
-    code = create_invite(uid)
-    return web.json_response({
-        "code": code,
-        "link": f"https://t.me/{bot_username}?start=invite_{code}"
-    })
-
-
-async def api_join_invite(request):
-    uid = await api_user(request)
-    try:
-        body = await request.json()
-    except Exception:
-        return web.json_response({"error": "JSON kerak"}, status=400)
-    ok, result = join_invite(uid, str(body.get("code", ""))[:100])
-    if not ok:
-        return web.json_response({"error": result}, status=400)
-    return web.json_response({"status": "ready", "message": result})
-
-
-async def api_token(request):
-    uid = await api_user(request)
-    session = get_session(uid)
-    if not session or session["status"] != "ready":
-        return web.json_response({"error": "Avval taklif yarating yoki qabul qiling."}, status=409)
-    if not livekit_ready():
-        return web.json_response({"error": "LiveKit sozlanmagan."}, status=503)
-
-    grants = api.VideoGrants(
-        room_join=True,
-        room=session["room_name"],
-        can_publish=True,
-        can_subscribe=True,
-        can_publish_data=True
-    )
-    token = (
-        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
-        .with_identity(str(uid))
-        .with_name(f"ASAVED-{uid}")
-        .with_ttl(timedelta(minutes=30))
-        .with_grants(grants)
-        .to_jwt()
-    )
-    return web.json_response({"url": LIVEKIT_URL, "token": token, "room": session["room_name"]})
-
-
-async def api_leave(request):
-    uid = await api_user(request)
-    con = connect_db()
-    row = con.execute("SELECT room_name FROM chat_sessions WHERE user_id=?", (uid,)).fetchone()
-    if row:
-        room = row["room_name"]
-        con.execute("DELETE FROM chat_sessions WHERE room_name=?", (room,))
-        con.execute("DELETE FROM chat_invites WHERE room_name=?", (room,))
-    con.commit()
-    con.close()
-    return web.json_response({"status": "stopped"})
-
-
-async def api_report(request):
-    uid = await api_user(request)
-    session = get_session(uid)
-    if not session:
-        return web.json_response({"error": "Faol suhbat yo‘q"}, status=400)
-    room = session["room_name"]
-    con = connect_db()
-    others = con.execute(
-        "SELECT user_id FROM chat_sessions WHERE room_name=? AND user_id<>?", (room, uid)
-    ).fetchall()
-    for other in others:
-        con.execute(
-            "INSERT INTO chat_reports(reporter_id,reported_id,room_name,reason,created_at) VALUES(?,?,?,?,?)",
-            (uid, other["user_id"], room, "Foydalanuvchi shikoyati", int(time.time()))
+        parsed = urlparse(raw.strip())
+        host = (parsed.hostname or "").lower()
+        return parsed.scheme == "https" and (
+            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
         )
-    con.commit()
-    con.close()
-    for admin_id in ADMIN_IDS:
+    except Exception:
+        return False
+
+
+def detect_platform(url: str) -> tuple[str, str]:
+    host = (urlparse(url).hostname or "").lower()
+    if "instagram.com" in host:
+        return "instagram", "Instagram"
+    if "tiktok.com" in host:
+        return "tiktok", "TikTok"
+    return "youtube", "YouTube"
+
+
+async def download_public_link(url: str, folder: Path, platform: str | None = None) -> Path:
+    try:
+        import yt_dlp
+    except ImportError:
+        raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
+
+    platform = platform or detect_platform(url)[0]
+    output_template = str(folder / "link_video.%(ext)s")
+    options = {
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "quality", "fps"],
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "max_filesize": MAX_LINK_BYTES,
+        "socket_timeout": 15,
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
+        "concurrent_fragment_downloads": 4,
+        "buffersize": 1024 * 1024,
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+        "remuxvideo": "mp4",
+    }
+
+    def do_download():
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+
+    log.info("Video yuklanmoqda: platforma=%s", platform)
+    await asyncio.to_thread(do_download)
+    files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
+    if not files:
+        raise RuntimeError("Video topilmadi yoki platforma yuklashga ruxsat bermadi.")
+    result = max(files, key=lambda p: p.stat().st_size)
+    if result.stat().st_size > MAX_LINK_BYTES:
+        raise RuntimeError("Video 49 MB dan katta. Boshqa, qisqaroq video havolasini yuboring.")
+    return result
+
+
+@router.message(F.text)
+async def handle_text(message: Message):
+    text = (message.text or "").strip()
+    mode = user_modes.get(message.from_user.id)
+
+    if mode in ("tts_male", "tts_female"):
+        await process_tts(message, text, mode)
+        return
+
+    if mode == "voice_choose":
+        await message.answer("Avval 👨 Erkak ovozi yoki 👩 Ayol ovozini tanlang.", reply_markup=voice_keyboard)
+        return
+
+    if mode == "link":
+        if not valid_video_url(text):
+            await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
+            return
+        status = await message.answer("⚡ Video tezkor rejimda yuklanmoqda... Odatda 1 daqiqada tayyor bo‘lishiga harakat qiladi.")
         try:
-            await bot.send_message(admin_id, f"🚨 ASAVED CHAT shikoyati\nShikoyatchi ID: {uid}\nSuhbat: {room}")
+            platform, platform_title = detect_platform(text)
+            async with VIDEO_SEMAPHORE:
+                with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
+                    video_path = await download_public_link(text, Path(tmp), platform)
+                    await message.answer_video(
+                        FSInputFile(video_path),
+                        caption=f"✅ {platform_title} videosi MP4 formatda tayyor!"
+                    )
+            await status.delete()
         except Exception:
-            logger.exception("Admin xabari yuborilmadi")
-    return web.json_response({"status": "reported"})
+            log.exception("Link download failed")
+            await status.edit_text(
+                "❌ Videoni olib bo‘lmadi.\n"
+                "Sabab: havola yopiq bo‘lishi, platforma cheklovi yoki video hajmi bo‘lishi mumkin.\n"
+                "O‘zingizga tegishli yoki yuklashga ruxsatingiz bor ochiq videoni sinab ko‘ring."
+            )
+        finally:
+            user_modes.pop(message.from_user.id, None)
+        return
+
+    if mode in ("round", "916"):
+        await message.answer("Iltimos, havola emas, galereyadan video fayl yuboring.")
+        return
+
+    if valid_video_url(text):
+        await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
+    else:
+        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
 
 
-# =========================================================
-# MINI APP SAHIFASI
-# =========================================================
-HTML_PAGE = r"""<!doctype html>
-<html lang="uz">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#10131a">
-<title>ASAVED CHAT</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#10131a;color:#fff;font-family:Arial,sans-serif}
-header{text-align:center;padding:22px 12px;font-size:25px;font-weight:800}
-#status{text-align:center;padding:14px;color:#c5cad5;min-height:58px;line-height:1.5}
-#videos{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:10px}
-.tile{background:#252b38;border-radius:14px;min-height:170px;overflow:hidden;position:relative}
-.tile video{width:100%;height:170px;object-fit:cover}.tile audio{display:none}
-.tile span{position:absolute;bottom:7px;left:7px;background:#000a;padding:5px 8px;border-radius:6px}
-.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:12px}
-button{border:0;border-radius:13px;padding:16px 8px;font-weight:700;font-size:15px;background:#303849;color:white}
-button:disabled{opacity:.45}.primary{background:#16885f}.danger{background:#bd3948}
-#invite{padding:12px;word-break:break-all;text-align:center;color:#bfc8d8}
-.note{text-align:center;color:#9da5b5;font-size:12px;padding:14px 18px;line-height:1.5}
-</style>
-</head>
-<body>
-<header>🌐 ASAVED CHAT</header>
-<div id="status">Suhbat boshlash uchun taklif yarating yoki sizga yuborilgan taklifni oching.</div>
-<div id="videos"></div>
-<div class="controls">
-<button class="primary" id="inviteBtn">🤝 Taklif yaratish</button>
-<button id="connectBtn">▶ Suhbatga ulanish</button>
-<button id="micBtn" disabled>🎙 Mikrofon</button>
-<button id="camBtn" disabled>📷 Kamera</button>
-<button class="danger" id="stopBtn" disabled>⛔ To‘xtatish</button>
-<button id="reportBtn" disabled>🚨 Shikoyat</button>
-<button id="copyBtn" disabled>📋 Taklifni ulashish</button>
-</div>
-<div id="invite"></div>
-<div class="note">Suhbat faqat siz qabul qilgan taklif orqali boshlanadi. Kamera va mikrofonni faqat o‘zingiz xohlaganingizda yoqing. Noqulay holatda suhbatni to‘xtating yoki shikoyat yuboring.</div>
-<script>
-const tg=window.Telegram.WebApp;tg.ready();tg.expand();
-const initData=tg.initData||"";
-const inviteCode=new URLSearchParams(location.search).get("invite");
-const statusEl=document.getElementById("status"),videos=document.getElementById("videos"),inviteEl=document.getElementById("invite");
-let room=null,localTracks=[],inviteLink="";
-function setStatus(s){statusEl.textContent=s}
-async function request(path,extra={}){
- const r=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({initData,...extra})});
- const d=await r.json().catch(()=>({}));
- if(!r.ok)throw new Error(d.error||("Server xatosi ("+r.status+")"));
- return d;
-}
-function setConnected(on){
- document.getElementById("connectBtn").disabled=on;
- document.getElementById("stopBtn").disabled=!on;
- document.getElementById("micBtn").disabled=!on;
- document.getElementById("camBtn").disabled=!on;
- document.getElementById("reportBtn").disabled=!on;
-}
-function addTrack(track,label){
- const el=track.attach(),tile=document.createElement("div"),tag=document.createElement("span");
- tile.className="tile";tile.appendChild(el);tag.textContent=label;tile.appendChild(tag);videos.appendChild(tile);
-}
-async function disconnect(){
- if(room){try{await room.disconnect()}catch(e){}room=null}
- localTracks.forEach(t=>{try{t.stop();t.detach().forEach(x=>x.remove())}catch(e){}});
- localTracks=[];videos.innerHTML="";setConnected(false);
-}
-async function connectRoom(){
- if(!window.LivekitClient)throw new Error("LiveKit kutubxonasi yuklanmadi. Internetni tekshiring.");
- const info=await request("/api/token");
- room=new LivekitClient.Room({adaptiveStream:true,dynacast:true});
- room.on(LivekitClient.RoomEvent.TrackSubscribed,t=>addTrack(t,"Suhbatdosh"));
- room.on(LivekitClient.RoomEvent.TrackUnsubscribed,t=>t.detach().forEach(x=>x.remove()));
- room.on(LivekitClient.RoomEvent.Disconnected,()=>{setStatus("Suhbat uzildi.");setConnected(false)});
- await room.connect(info.url,info.token);
- localTracks=await LivekitClient.createLocalTracks({audio:true,video:true});
- for(const t of localTracks){await room.localParticipant.publishTrack(t);if(t.kind==="video")addTrack(t,"Siz")}
- room.remoteParticipants.forEach(p=>p.trackPublications.forEach(pub=>{if(pub.track)addTrack(pub.track,"Suhbatdosh")}));
- setConnected(true);setStatus("✅ Suhbatga ulandingiz!");
-}
-document.getElementById("inviteBtn").onclick=async()=>{
- try{setStatus("Taklif yaratilmoqda...");const d=await request("/api/invite");inviteLink=d.link;inviteEl.textContent=inviteLink;
- document.getElementById("copyBtn").disabled=false;setStatus("✅ Taklif tayyor. Havolani faqat ishonchli suhbatdoshingizga yuboring.")}
- catch(e){setStatus("❌ "+e.message)}
-};
-document.getElementById("connectBtn").onclick=async()=>{
- try{
-  if(inviteCode){setStatus("Taklif tekshirilmoqda...");await request("/api/join-invite",{code:inviteCode})}
-  else if(!inviteLink){throw new Error("Avval taklif yarating yoki taklif havolasini oching.")}
-  setStatus("Kamera va mikrofon ruxsati so‘ralmoqda...");
-  const test=await navigator.mediaDevices.getUserMedia({audio:true,video:true});test.getTracks().forEach(t=>t.stop());
-  await connectRoom();
- }catch(e){setStatus("❌ Ulanish xatosi: "+e.message);await disconnect()}
-};
-document.getElementById("stopBtn").onclick=async()=>{
- await disconnect();try{await request("/api/leave")}catch(e){}setStatus("Suhbat tugatildi.");
-};
-document.getElementById("micBtn").onclick=async()=>{
- if(!room)return;const on=room.localParticipant.isMicrophoneEnabled;
- await room.localParticipant.setMicrophoneEnabled(!on);
- document.getElementById("micBtn").textContent=on?"🔇 Mikrofon o‘chiq":"🎙 Mikrofon yoqilgan";
-};
-document.getElementById("camBtn").onclick=async()=>{
- if(!room)return;const on=room.localParticipant.isCameraEnabled;
- await room.localParticipant.setCameraEnabled(!on);
- document.getElementById("camBtn").textContent=on?"📷 Kamera o‘chiq":"📷 Kamera yoqilgan";
-};
-document.getElementById("reportBtn").onclick=async()=>{
- try{await request("/api/report");setStatus("🚨 Shikoyat yuborildi. Suhbatni tugatishingiz mumkin.")}
- catch(e){setStatus("❌ "+e.message)}
-};
-document.getElementById("copyBtn").onclick=async()=>{
- if(!inviteLink)return;
- try{if(navigator.share)await navigator.share({title:"ASAVED CHAT",text:"ASAVED CHAT taklifi",url:inviteLink});
- else{await navigator.clipboard.writeText(inviteLink);setStatus("Taklif havolasi nusxalandi.")}}
- catch(e){setStatus("Taklif: "+inviteLink)}
-};
-if(inviteCode){document.getElementById("inviteBtn").disabled=true;setStatus("Sizga taklif yuborilgan. Ulanish tugmasini bosing.")}
-window.addEventListener("pagehide",()=>{if(room){try{room.disconnect()}catch(e){}}});
-</script>
-</body></html>"""
+@router.message(F.video | F.document)
+async def handle_video(message: Message):
+    mode = user_modes.get(message.from_user.id)
+    if mode not in ("round", "916"):
+        await message.answer("Avval 🎥 Dumaloq video yoki 📱 9:16 format tugmasini tanlang.")
+        return
+    if not get_video_info(message):
+        await message.answer("Iltimos, video fayl yuboring.")
+        return
+    await process_uploaded_video(message, mode)
 
 
-# =========================================================
-# WEB SERVER / WEBHOOK
-# =========================================================
-async def chat_page(request):
-    return web.Response(text=HTML_PAGE, content_type="text/html", headers={"Cache-Control": "no-store"})
+@router.message()
+async def fallback(message: Message):
+    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
 
 
-async def health(request):
-    return web.json_response({"status": "ASAVED is running", "channel": CHANNEL_USERNAME, "chat": "/chat"})
-
-
-async def on_startup(app):
-    global bot_username
-    init_db()
-    me = await bot.get_me()
-    bot_username = me.username or ""
+async def on_startup():
+    init_user_db()
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
-        secret_token=WEBHOOK_SECRET or None,
-        drop_pending_updates=False
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=dp.resolve_used_update_types()
     )
-    logger.info("ASAVED ishga tushdi. Kanal: %s", CHANNEL_USERNAME)
-    logger.info("Bot username: @%s", bot_username)
-    logger.info("Mini App URL: %s", MINI_APP_URL)
-    logger.info("Webhook: %s", webhook_url)
+    log.info("Webhook set: %s", webhook_url)
 
 
-async def on_cleanup(app):
-    try:
-        await bot.delete_webhook()
-    except Exception:
-        logger.exception("Webhookni o‘chirishda xato")
+async def on_shutdown():
+    await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
 
 
-def create_app():
-    app = web.Application(client_max_size=30 * 1024 * 1024)
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    app.router.add_get("/chat", chat_page)
-    app.router.add_post("/api/invite", api_invite)
-    app.router.add_post("/api/join-invite", api_join_invite)
-    app.router.add_post("/api/token", api_token)
-    app.router.add_post("/api/leave", api_leave)
-    app.router.add_post("/api/report", api_report)
+async def main():
+    # Bazani webhook ishga tushishidan oldin ham tayyorlaymiz.
+    init_user_db()
+
+    app = web.Application(client_max_size=2 * 1024 * 1024)
+    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
+    app.router.add_get("/health", lambda request: web.Response(text="ok"))
     SimpleRequestHandler(
-        dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET or None
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET
     ).register(app, path=f"/{WEBHOOK_PATH}")
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
-    return app
+    app.on_startup.append(lambda app: on_startup())
+    app.on_cleanup.append(lambda app: on_shutdown())
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("ASAVED listening on port %s", PORT)
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
-    web.run_app(create_app(), host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    asyncio.run(main())
