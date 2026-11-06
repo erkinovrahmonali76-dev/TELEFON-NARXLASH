@@ -1,0 +1,47 @@
+
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ASAVED CHAT</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/livekit-client/dist/livekit-client.umd.min.js"></script>
+</head>
+<body>
+  <main class="app">
+    <header>
+      <h1>ASAVED <span>CHAT</span></h1>
+      <p>Tasodifiy guruhlar bilan suhbat</p>
+    </header>
+
+    <section class="video-grid" id="videoGrid">
+      <div class="video-card waiting">
+        <div class="avatar">👥</div>
+        <p id="status">Guruh xonasi kutilyapti...</p>
+      </div>
+    </section>
+
+    <div class="controls">
+      <button id="micBtn">🎤 Mikrofon</button>
+      <button id="cameraBtn">📷 Kamera</button>
+    </div>
+
+    <button id="joinBtn" class="primary">
+      🌐 Guruhga qo‘shilish
+    </button>
+
+    <div class="bottom">
+      <button id="skipBtn">⏭ Skip</button>
+      <button id="reportBtn">🚩 Shikoyat</button>
+    </div>
+
+    <p class="notice">
+      Faqat yoshga mos guruhlar. Qoidabuzarliklar moderatorlarga yuboriladi.
+    </p>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
