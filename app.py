@@ -46,6 +46,8 @@ sub_kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🎬 Ki
 def main_text(): return ('Assalomu alaykum! <b>Kino Olami</b> botiga xush kelibsiz.\n\n🎬 Kino qidirish — kino kodi yoki nomini yuboring.\n📁 Mening videolarim — saqlangan fayllar.\n🎥 Video formatlash va boshqa funksiyalar ham mavjud.')
 user_modes:dict[int,str]={}; uploads:dict[int,dict]={}; sub_cache={}; SUB_TTL=30
 video_sem=asyncio.Semaphore(2); tts_sem=asyncio.Semaphore(2)
+# Katalogga kino/serial videolari file_id orqali saqlanadi; yuklab olish cheklovi qo‘llanmaydi.
+# Dumaloq/9:16 formatlashda Telegram Bot API getFile cheklovi sabab 20 MB saqlanadi.
 MAX_UPLOAD=20*1024*1024; MAX_OUTPUT=49*1024*1024; MAX_SECONDS=600; MAX_TTS=3000
 ALLOWED_HOSTS={'youtube.com','www.youtube.com','m.youtube.com','youtu.be','instagram.com','www.instagram.com','tiktok.com','www.tiktok.com','vm.tiktok.com','vt.tiktok.com'}
 ELEVEN_KEY=os.getenv('ELEVENLABS_API_KEY','').strip(); TTS_MODEL=os.getenv('ELEVENLABS_MODEL_ID','eleven_multilingual_v2').strip()
@@ -89,10 +91,21 @@ def saved_list(uid):
 def saved_get(vid,uid):
     with db() as c: return c.execute('SELECT file_id,media_type,label FROM saved_videos WHERE id=? AND user_id=?',(vid,uid)).fetchone()
 def catalog_search(q):
+    q = (q or '').strip()
+    if not q:
+        return []
     with db() as c:
-        if q.isdigit(): rows=c.execute('SELECT id,code,kind,title FROM catalog WHERE code=?',(int(q),)).fetchall()
-        else: rows=c.execute('SELECT id,code,kind,title FROM catalog WHERE title LIKE ? ORDER BY code LIMIT 15',(f'%{q}%',)).fetchall()
-        return rows
+        if q.isdigit():
+            rows = c.execute(
+                'SELECT id,code,kind,title FROM catalog WHERE code=?',
+                (int(q),)
+            ).fetchall()
+            if rows:
+                return rows
+        return c.execute(
+            'SELECT id,code,kind,title FROM catalog WHERE title LIKE ? ORDER BY code LIMIT 15',
+            (f'%{q}%',)
+        ).fetchall()
 def catalog_get(cid):
     with db() as c:
         c.row_factory=sqlite3.Row; r=c.execute('SELECT * FROM catalog WHERE id=?',(cid,)).fetchone(); return dict(r) if r else None
@@ -192,6 +205,15 @@ async def done_episodes(m:Message):
     u=uploads.get(m.from_user.id)
     if not is_admin(m.from_user.id) or not u or u.get('kind')!='series' or u.get('step')!='media' or u.get('count',0)<1: await m.answer('❌ Yakunlash uchun faol serial va kamida bitta qism kerak.'); return
     await m.answer(f"✅ Serial saqlandi!\n🎬 {html.escape(u['title'])}\n🔢 Kod: {u['code']}\n📺 Qismlar: {u['count']} ta",reply_markup=menu_for(m.from_user.id)); uploads.pop(m.from_user.id,None)
+@router.message(Command('search'))
+async def search_command(m:Message):
+    parts = (m.text or '').split(maxsplit=1)
+    if len(parts) < 2:
+        user_modes[m.from_user.id] = 'search'
+        await m.answer('🎬 Kino yoki serial kodini/nomini yuboring:')
+        return
+    await show_results(m, parts[1].strip())
+
 @router.message(F.text==BTN_SEARCH)
 async def search_start(m:Message): user_modes[m.from_user.id]='search'; await m.answer('🎬 Kino yoki serial nomini/kodini yuboring:')
 async def show_results(m,q):
@@ -353,7 +375,15 @@ async def text_handler(m:Message):
         if step=='poster':
             if text!='/skip': await m.answer('Poster yuboring yoki /skip.'); return
             u['poster']=None; await create_catalog_record(m,u); return
-        if step=='media': await m.answer('🎞 Video yuboring. Serial tugasa /doneepisodes yozing.'); return
+        if step=='media':
+            # Serial/bittalik kino videosi bazaga yozilgan. Admin shu payt ham
+            # katalogni tekshirish uchun kod yoki nom yuborishi mumkin.
+            # /doneepisodes alohida Command handler orqali yakunlanadi.
+            if text:
+                await show_results(m, text)
+                return
+            await m.answer('🎞 Video yuboring. Serial tugasa /doneepisodes yozing.')
+            return
     if mode=='search': user_modes.pop(uid,None); await show_results(m,text); return
     if mode in ('tts_male','tts_female'): await process_tts(m,text,mode); return
     if mode=='voice_choose': await m.answer('Erkak yoki ayol ovozini tanlang.',reply_markup=voice_keyboard); return
@@ -394,7 +424,6 @@ async def media_handler(m:Message):
         info=get_video_info(m)
         if not info: await m.answer('❌ Video fayl yuboring.'); return
         fid,size,dur,typ=info
-        if size and size>MAX_UPLOAD: await m.answer('❌ Video 20 MB dan katta.'); return
         if u['kind']=='movie' and u['count']>=1: await m.answer('Bu bittalik kino. Bitta video yetarli.'); return
         num=u['count']+1
         with db() as c: c.execute('INSERT INTO episodes(catalog_id,episode_number,file_id,media_type) VALUES(?,?,?,?)',(u['catalog_id'],num,fid,typ))
