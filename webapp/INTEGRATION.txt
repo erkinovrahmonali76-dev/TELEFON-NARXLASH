@@ -1,0 +1,52 @@
+ASAVED Web Panel integratsiyasi
+
+1) admin_panel.py faylini app.py bilan bir papkaga qo‘ying.
+2) app.py importlariga qo‘shing:
+   from admin_panel import setup_admin_panel, get_channels, is_blocked
+
+3) main() ichida setup_contest(app, bot, ADMIN_IDS) dan keyin:
+   setup_admin_panel(app, bot, DB_PATH, WEBHOOK_SECRET, ADMIN_IDS)
+
+4) app.py dagi is_subscribed funksiyasini quyidagiga almashtiring:
+
+async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
+    channels = get_channels(DB_PATH)
+    if not channels:
+        return True
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(channel["chat_id"], user_id)
+            if member.status not in {
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            }:
+                return False
+        except Exception:
+            log.exception("Obuna tekshirishda xatolik: %s", channel["chat_id"])
+            return False
+    return True
+
+5) SubscriptionMiddleware ichida register_user dan keyin blok tekshiruvini qo‘shing:
+   if is_blocked(DB_PATH, event.from_user.id):
+       await event.answer("⛔ Siz botdan foydalanishdan bloklangansiz.")
+       return None
+
+6) Admin panelni ochish:
+   https://SIZNING-RENDER-MANZILINGIZ/admin
+
+Render → Environment ga quyidagilarni kiriting:
+   ADMIN_PANEL_PASSWORD = kamida 12 belgili maxfiy parol
+   WEBHOOK_SECRET = mavjud maxfiy qiymat
+   ADMIN_IDS = Telegram admin ID(lar)i
+
+7) Kanal qo‘shishdan oldin botni o‘sha kanalga administrator qiling.
+   Ommaviy kanal: @username va https://t.me/username
+   Yopiq kanal: -100... ID va https://t.me/+... taklif havolasi
+
+Muhim:
+- Mavjud contest.py va /contest Mini App saqlanadi. Web Panelda konkurs yaratish/boshqarish bo‘limi yo‘q.
+- Web Panel sessiyasi 8 soatlik, HttpOnly/Secure cookie bilan himoyalangan.
+- Kanalni o‘chirib qo‘yish foydalanuvchilarga keyingi tekshiruvda ta’sir qiladi.
+- Bot matn sozlamalari panelda saqlanadi, lekin app.py dagi main_text()/AD_TEXT ni bazadan o‘qishga ulash alohida integratsiya talab qiladi.
+- Telefon raqamlari botda yig‘ilmayotgani sababli hozircha raqamlar bo‘limi yo‘q.
