@@ -67,44 +67,38 @@ def _valid_cookie(secret, value):
 
 def setup_admin_panel(app, bot, db_path, webhook_secret, admin_ids):
     init_panel_db(db_path)
-    password = __import__("os").getenv("ADMIN_PANEL_PASSWORD", "").strip()
-    if len(password) < 12:
-        raise RuntimeError("ADMIN_PANEL_PASSWORD Render Environment'da kamida 12 belgidan iborat bo‘lsin")
-
-    def authorized(request):
-        return _valid_cookie(webhook_secret, request.cookies.get(COOKIE_NAME, ""))
+    def valid_telegram_init_data(init_data: str) -> int | None:
+        """Validate Telegram Mini App initData and return an authorized admin ID."""
+        from urllib.parse import parse_qsl
+        if not init_data or len(init_data) > 10000:
+            return None
+        try:
+            values = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=True))
+            received_hash = values.pop("hash", "")
+            auth_date = int(values.get("auth_date", "0"))
+            if not received_hash or abs(int(time.time()) - auth_date) > 300:
+                return None
+            check_string = "\n".join(f"{k}={v}" for k, v in sorted(values.items()))
+            secret_key = hmac.new(b"WebAppData", bot.token.encode(), hashlib.sha256).digest()
+            expected = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(received_hash, expected):
+                return None
+            user = json.loads(values.get("user", "{}"))
+            user_id = int(user.get("id", 0))
+            return user_id if user_id in admin_ids else None
+        except Exception:
+            return None
 
     @web.middleware
     async def panel_security(request, handler):
-        if request.path.startswith("/admin"):
-            if request.path in ("/admin/login", "/admin/logout"):
-                return await handler(request)
-            if not authorized(request):
-                if request.path.startswith("/admin/api/"):
-                    raise web.HTTPUnauthorized(text="Sessiya tugagan")
-                raise web.HTTPFound("/admin/login")
+        if request.path.startswith("/admin/api/"):
+            user_id = valid_telegram_init_data(request.headers.get("X-Telegram-Init-Data", ""))
+            if user_id is None:
+                raise web.HTTPUnauthorized(text="Faqat Telegram adminlari kira oladi")
+            request["admin_user_id"] = user_id
         return await handler(request)
 
-    # Middleware ro‘yxatiga alohida qo‘shish uchun app yaratilishida ishlatiladi.
     app.middlewares.append(panel_security)
-
-    async def login_page(request):
-        return web.Response(text=LOGIN_HTML, content_type="text/html")
-
-    async def login_post(request):
-        data = await request.post()
-        supplied = str(data.get("password", ""))
-        if not hmac.compare_digest(supplied, password):
-            return web.Response(text=LOGIN_HTML.replace("XATO_XABAR", "Parol noto‘g‘ri"), content_type="text/html", status=401)
-        response = web.HTTPFound("/admin")
-        response.set_cookie(COOKIE_NAME, _make_cookie(webhook_secret), httponly=True,
-                            secure=True, samesite="Strict", max_age=SESSION_SECONDS, path="/admin")
-        raise response
-
-    async def logout(request):
-        response = web.HTTPFound("/admin/login")
-        response.del_cookie(COOKIE_NAME, path="/admin")
-        raise response
 
     async def dashboard(request):
         stats = {
@@ -231,8 +225,7 @@ def setup_admin_panel(app, bot, db_path, webhook_secret, admin_ids):
         return web.json_response({"ok": True})
 
     routes = [
-        web.get("/admin/login", login_page), web.post("/admin/login", login_post),
-        web.get("/admin/logout", logout), web.get("/admin", dashboard),
+        web.get("/admin", dashboard),
         web.get("/admin/api/stats", api_stats), web.get("/admin/api/users", api_users),
         web.post("/admin/api/user-action", api_user_action),
         web.get("/admin/api/channels", api_channels), web.post("/admin/api/channels", api_add_channel),
@@ -253,7 +246,7 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="uz"><head><meta charset="utf-8">
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0b1018;color:#e8edf5;font:15px Inter,Arial,sans-serif}.top{padding:24px 5%;border-bottom:1px solid #263141;display:flex;justify-content:space-between;align-items:center}.top h1{margin:0;font-size:25px}.wrap{max-width:1150px;margin:auto;padding:25px 4% 100px}.tabs{display:flex;gap:8px;overflow:auto;padding-bottom:18px}.tabs button,.action{background:#192331;color:#dce5f2;border:1px solid #2c3a4d;padding:12px 16px;border-radius:12px;white-space:nowrap;cursor:pointer}.tabs button.active,.primary{background:#e6a72b;color:#151515;border-color:#e6a72b;font-weight:700}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:14px}.card{background:#151d28;border:1px solid #293647;border-radius:18px;padding:20px;margin-bottom:16px}.muted{color:#8795a7}.num{font-size:36px;font-weight:750;margin:10px 0}.section{display:none}.section.active{display:block}input,textarea,select{width:100%;padding:13px;margin:7px 0 12px;border-radius:11px;border:1px solid #334256;background:#0d1520;color:#fff}textarea{min-height:110px;resize:vertical}label{color:#aebaca}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.row>*{flex:1}button{cursor:pointer}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:500px}td,th{text-align:left;padding:12px;border-bottom:1px solid #2a3544}th{color:#93a2b4}.tag{color:#62d89a}.danger{background:#4b222b!important;color:#ffd9dd!important}.small{font-size:12px}.logout{color:#f1bd55;text-decoration:none}@media(max-width:600px){.top{padding:18px 5%}.wrap{padding:18px 4% 90px}.card{padding:16px}.num{font-size:30px}}
 </style></head><body>
-<header class="top"><h1>ASAVED <span class="muted">/ Admin</span></h1><a class="logout" href="/admin/logout">Chiqish ↗</a></header>
+<header class="top"><h1>ASAVED <span class="muted">/ Admin</span></h1><span class="logout">Telegram admin</span></header>
 <main class="wrap">
 <nav class="tabs"><button class="active" data-tab="dash">Dashboard</button><button data-tab="users">Ishtirokchilar</button><button data-tab="channels">Kanallar</button><button data-tab="broadcast">Xabar yuborish</button><button data-tab="settings">Dizayn / Matn</button><button data-tab="admins">Adminlar</button></nav>
 <section id="dash" class="section active"><h2>Boshqaruv</h2><div class="grid">
@@ -269,9 +262,10 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="uz"><head><meta charset="utf-8">
 <section id="settings" class="section"><h2>Bot matnlari va dizayni</h2><div class="card"><label>Salomlashuv matni</label><textarea id="welcome_text"></textarea><label>Reklama matni</label><textarea id="ad_text"></textarea><label>Bot tavsifi</label><textarea id="bot_description"></textarea><button class="action primary" onclick="saveSettings()">Saqlash</button><p class="muted small">Matnlar bazaga saqlanadi. Bot kodi ularni o‘qishi uchun app.py dagi main_text va AD_TEXT o‘qish funksiyalarini ulash kerak.</p></div></section>
 <section id="admins" class="section"><h2>Panel adminlari</h2><div class="card"><label>Yangi admin Telegram ID</label><input id="newAdminId" inputmode="numeric" placeholder="123456789"><button class="action primary" onclick="addAdmin()">Admin qo‘shish</button></div><div class="card" id="adminsRows"></div><p class="muted small">Bu ro‘yxat Web Panel boshqaruvchilarini qayd etadi. Bot ichidagi admin huquqi uchun ADMIN_IDS Environment qiymatini ham sozlang.</p></section>
 </main>
-<script>
+<script src="https://telegram.org/js/telegram-web-app.js"></script><script>
+const tg=window.Telegram?.WebApp;tg?.ready();tg?.expand();
 const $=id=>document.getElementById(id);
-async function api(url,opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});if(!r.ok){let t=await r.text();throw new Error(t||('HTTP '+r.status))}return r.json()}
+async function api(url,opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''},...opts});if(!r.ok){let t=await r.text();throw new Error(t||('HTTP '+r.status))}return r.json()}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.section').forEach(x=>x.classList.remove('active'));b.classList.add('active');$(b.dataset.tab).classList.add('active');if(b.dataset.tab==='users')loadUsers();if(b.dataset.tab==='channels')loadChannels();if(b.dataset.tab==='settings')loadSettings();if(b.dataset.tab==='admins')loadAdmins()});
 async function loadStats(){let s=await api('/admin/api/stats');$('total').textContent=s.total;$('today').textContent=s.today;$('active24').textContent=s.active24;$('blocked').textContent=s.blocked;$('channelsCount').textContent=s.channels}
 async function loadUsers(){let q=encodeURIComponent($('userSearch').value||'');let a=await api('/admin/api/users?q='+q);$('usersRows').innerHTML=a.map(u=>`<tr><td>${u.user_id}</td><td>${u.first_seen||'—'}</td><td>${u.last_seen||'—'}</td><td>${u.blocked?'Bloklangan':'Faol'}</td><td><button class="action ${u.blocked?'':'danger'}" onclick="userAction(${u.user_id},'${u.blocked?'unblock':'block'}')">${u.blocked?'Ochish':'Bloklash'}</button></td></tr>`).join('')}
@@ -286,5 +280,5 @@ async function saveSettings(){await api('/admin/api/settings',{method:'POST',bod
 async function loadAdmins(){let a=await api('/admin/api/admins');$('adminsRows').innerHTML=a.map(x=>`<p>${x.user_id} <button class="action danger" onclick="removeAdmin(${x.user_id})">O‘chirish</button></p>`).join('')||'Hali qo‘shimcha admin yo‘q'}
 async function addAdmin(){let id=$('newAdminId').value;await api('/admin/api/admins',{method:'POST',body:JSON.stringify({user_id:id})});$('newAdminId').value='';loadAdmins()}
 async function removeAdmin(id){await api('/admin/api/admins/'+id,{method:'DELETE'});loadAdmins()}
-loadStats().catch(e=>alert(e.message));
+if(!tg?.initData){document.querySelector("main").innerHTML="<div class=card><h2>ASAVED Admin</h2><p>Admin panelni bot ichidagi ⚙️ Admin panel tugmasi orqali oching.</p></div>"}else{loadStats().catch(e=>alert("Kirish rad etildi. Telegram admin ID tekshirilsin."));}
 </script></body></html>"""
