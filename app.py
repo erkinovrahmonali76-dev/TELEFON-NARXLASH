@@ -20,7 +20,9 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, WebAppInfo,
 )
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
 from contest import setup_contest
+from admin_panel import setup_admin_panel, get_channels, is_blocked
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("asaved")
@@ -30,14 +32,12 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "asaved-webhook").strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-CHANNEL_USERNAME = "@ReklamaBozoriUzz"
-CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN Environment Variable kiritilmagan")
 if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECRET):
-    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin; faqat harf, raqam, _ yoki - ishlating")
+    raise RuntimeError("WEBHOOK_SECRET kamida 16 ta belgi bo‘lsin")
 if not BASE_URL.startswith("https://"):
     raise RuntimeError("RENDER_EXTERNAL_URL HTTPS manzil bo‘lishi kerak")
 
@@ -61,27 +61,33 @@ keyboard = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_TTS)],
     ], resize_keyboard=True, input_field_placeholder="Kerakli funksiyani tanlang"
 )
-
 voice_keyboard = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=BTN_MALE), KeyboardButton(text=BTN_FEMALE)],
-              [KeyboardButton(text="⬅️ Asosiy menyu")]],
-    resize_keyboard=True, input_field_placeholder="Ovoz turini tanlang"
+    keyboard=[
+        [KeyboardButton(text=BTN_MALE), KeyboardButton(text=BTN_FEMALE)],
+        [KeyboardButton(text="⬅️ Asosiy menyu")],
+    ], resize_keyboard=True, input_field_placeholder="Ovoz turini tanlang"
 )
 
-subscribe_keyboard = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📢 Kanalga obuna bo‘lish", url=CHANNEL_URL)],
-    [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")],
-])
-
 _ad_ids = os.getenv("ADMIN_IDS", "") or os.getenv("ADMIN_ID", "")
-ADMIN_IDS = {int(x.strip()) for x in _ad_ids.replace(";", ",").split(",") if x.strip().isdigit()}
+ADMIN_IDS = {
+    int(x.strip()) for x in _ad_ids.replace(";", ",").split(",")
+    if x.strip().isdigit()
+}
 
-AD_TEXT = (
+AD_TEXT_DEFAULT = (
     "🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\n"
     "Telegram kanalingiz rivojlanishini xohlaysizmi? ASAVED orqali reklama imkoniyatidan foydalaning!\n\n"
     "📣 Kanalingizni ASAVED foydalanuvchilariga tanitamiz.\n\n"
     "👤 Admin: @akramovx7\n"
     '<a href="https://t.me/akramovx7">Murojaat qilish</a>'
+)
+WELCOME_DEFAULT = (
+    "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
+    "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
+    "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
+    "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
+    "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor AI ovozida MP3 qiling.\n\n"
+    "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
 )
 
 contest_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -116,88 +122,138 @@ MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
 
+def db_connect():
+    return sqlite3.connect(DB_PATH, timeout=30)
+
+
 def init_user_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS ad_sent_users (user_id INTEGER PRIMARY KEY, sent_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-        conn.execute("CREATE TABLE IF NOT EXISTS bot_users (user_id INTEGER PRIMARY KEY, first_seen TEXT DEFAULT CURRENT_TIMESTAMP, last_seen TEXT DEFAULT CURRENT_TIMESTAMP)")
-        conn.execute("INSERT OR IGNORE INTO bot_users (user_id) SELECT user_id FROM ad_sent_users")
-        conn.commit()
+    with db_connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS ad_sent_users (
+            user_id INTEGER PRIMARY KEY, sent_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS bot_users (
+            user_id INTEGER PRIMARY KEY,
+            first_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+            last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+        )""")
+        conn.execute("INSERT OR IGNORE INTO bot_users(user_id) SELECT user_id FROM ad_sent_users")
 
 
 def register_user(user_id: int):
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.execute("INSERT INTO bot_users (user_id) VALUES (?) ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP", (user_id,))
-        conn.commit()
+    with db_connect() as conn:
+        conn.execute(
+            """INSERT INTO bot_users(user_id) VALUES(?)
+            ON CONFLICT(user_id) DO UPDATE SET last_seen=CURRENT_TIMESTAMP""",
+            (user_id,),
+        )
 
 
 def get_all_user_ids() -> list[int]:
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        return [int(r[0]) for r in conn.execute("SELECT user_id FROM bot_users").fetchall()]
+    with db_connect() as conn:
+        return [int(r[0]) for r in conn.execute("SELECT user_id FROM bot_users")]
 
 
 def mark_ad_sent_once(user_id: int) -> bool:
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        cur = conn.execute("INSERT OR IGNORE INTO ad_sent_users (user_id) VALUES (?)", (user_id,))
-        conn.commit()
+    with db_connect() as conn:
+        cur = conn.execute("INSERT OR IGNORE INTO ad_sent_users(user_id) VALUES(?)", (user_id,))
         return cur.rowcount == 1
+
+
+def get_setting(key: str, default: str) -> str:
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT value FROM panel_settings WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else default
+    except sqlite3.Error:
+        return default
+
+
+def main_text() -> str:
+    return get_setting("welcome_text", WELCOME_DEFAULT)
+
+
+def ad_text() -> str:
+    return get_setting("ad_text", AD_TEXT_DEFAULT)
 
 
 async def send_ad_once(chat_id: int, user_id: int):
     try:
         if not mark_ad_sent_once(user_id):
             return
-        await bot.send_message(chat_id, AD_TEXT, disable_web_page_preview=True)
+        await bot.send_message(chat_id, ad_text(), disable_web_page_preview=True)
     except Exception:
         log.exception("Reklama xabarini yuborishda xatolik: %s", user_id)
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        with db_connect() as conn:
             conn.execute("DELETE FROM ad_sent_users WHERE user_id=?", (user_id,))
-            conn.commit()
-
-
-def main_text() -> str:
-    return (
-        "Assalomu alaykum! <b>ASAVED</b> botiga xush kelibsiz.\n\n"
-        "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
-        "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
-        "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
-        "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor AI ovozida MP3 qiling.\n\n"
-        "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
-    )
 
 
 async def is_subscribed(user_id: int, use_cache: bool = True) -> bool:
     now = asyncio.get_running_loop().time()
     if use_cache and subscription_cache.get(user_id, 0) > now:
         return True
-    try:
-        member = await bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        ok = member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
-        if ok:
-            subscription_cache[user_id] = now + SUBSCRIPTION_CACHE_SECONDS
-        else:
+    channels = get_channels(DB_PATH)
+    if not channels:
+        return True
+    for channel in channels:
+        try:
+            member = await bot.get_chat_member(channel["chat_id"], user_id)
+            if member.status not in {
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            }:
+                subscription_cache.pop(user_id, None)
+                return False
+        except Exception:
+            log.exception("Kanal obunasini tekshirishda xatolik: %s", channel["chat_id"])
             subscription_cache.pop(user_id, None)
-        return ok
-    except Exception:
-        log.exception("Kanal obunasini tekshirishda xatolik")
-        return False
+            return False
+    subscription_cache[user_id] = now + SUBSCRIPTION_CACHE_SECONDS
+    return True
+
+
+def subscription_markup():
+    rows = []
+    for channel in get_channels(DB_PATH):
+        rows.append([InlineKeyboardButton(text=f"📢 {channel['title']}", url=channel["join_url"])])
+    rows.append([InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_subscription")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def send_subscription_required(message: Message):
-    await message.answer("⛔ Botdan foydalanish uchun avval kanalimizga obuna bo‘ling.\nObuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.", reply_markup=subscribe_keyboard)
+    await message.answer(
+        "⛔ Botdan foydalanish uchun avval quyidagi kanal(lar)ga obuna bo‘ling.\n"
+        "Obuna bo‘lgach, «Obunani tekshirish» tugmasini bosing.",
+        reply_markup=subscription_markup(),
+    )
 
 
 class SubscriptionMiddleware(BaseMiddleware):
-    async def __call__(self, handler: Callable[[Message, dict[str, Any]], Awaitable[Any]], event: Message, data: dict[str, Any]) -> Any:
+    async def __call__(
+        self,
+        handler: Callable[[Message, dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: dict[str, Any],
+    ) -> Any:
         if not event.from_user:
             return await handler(event, data)
-        register_user(event.from_user.id)
+
+        uid = event.from_user.id
+        register_user(uid)
+
         if event.text and event.text.split()[0].split("@")[0] == "/myid":
             return await handler(event, data)
-        if event.from_user.id in ADMIN_IDS or await is_subscribed(event.from_user.id):
-            if event.from_user.id not in ADMIN_IDS:
-                await send_ad_once(event.chat.id, event.from_user.id)
+
+        if is_blocked(DB_PATH, uid):
+            await event.answer("⛔ Siz admin tomonidan botdan foydalanishdan bloklangansiz.")
+            return None
+
+        if uid in ADMIN_IDS or await is_subscribed(uid):
+            if uid not in ADMIN_IDS:
+                await send_ad_once(event.chat.id, uid)
             return await handler(event, data)
+
         await send_subscription_required(event)
         return None
 
@@ -225,31 +281,36 @@ async def check_subscription_callback(callback: CallbackQuery):
     if not callback.from_user:
         await callback.answer()
         return
-    register_user(callback.from_user.id)
-    if callback.from_user.id in ADMIN_IDS or await is_subscribed(callback.from_user.id, use_cache=False):
+    uid = callback.from_user.id
+    register_user(uid)
+    if uid in ADMIN_IDS or (not is_blocked(DB_PATH, uid) and await is_subscribed(uid, use_cache=False)):
+        subscription_cache.pop(uid, None)
         await callback.answer("✅ Obuna tasdiqlandi!")
         if callback.message:
-            if callback.from_user.id not in ADMIN_IDS:
-                await send_ad_once(callback.message.chat.id, callback.from_user.id)
+            if uid not in ADMIN_IDS:
+                await send_ad_once(callback.message.chat.id, uid)
             await send_welcome(callback.message)
     else:
-        await callback.answer("❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!", show_alert=True)
+        await callback.answer("❌ Hali barcha kanallarga obuna bo‘lmagansiz.", show_alert=True)
 
 
 @router.message(Command("myid"))
 async def show_my_id(message: Message):
     if message.from_user:
-        await message.answer(f"🆔 Telegram ID: <code>{message.from_user.id}</code>\nRender → Environment → ADMIN_IDS ga kiriting.")
+        await message.answer(
+            f"🆔 Telegram ID: <code>{message.from_user.id}</code>\n"
+            "Render → Environment → ADMIN_IDS ga kiriting."
+        )
 
 
 @router.message(Command("admin"))
-async def admin_panel(message: Message):
+async def admin_panel_command(message: Message):
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔ Sizda admin huquqi yo‘q.")
         return
     await message.answer(
         f"🛠 <b>Admin panel</b>\n\n👥 Bazadagi foydalanuvchilar: <b>{len(get_all_user_ids())}</b>\n"
-        "Reklamani hammaga yuborish uchun tugmani bosing.",
+        "Web Panel: /admin",
         reply_markup=admin_reply_keyboard(),
     )
 
@@ -259,20 +320,23 @@ async def choose_winner(message: Message):
     if not message.from_user or message.from_user.id not in ADMIN_IDS:
         await message.answer("⛔ Sizda admin huquqi yo‘q.")
         return
-    # G‘olib tanlash faqat admin /winner buyrug‘ini berganida bajariladi.
     try:
         with sqlite3.connect(os.getenv("CONTEST_DB_PATH", DB_PATH), timeout=30) as conn:
-            rows = conn.execute("SELECT user_id, username, first_name FROM contest_entries").fetchall()
+            rows = conn.execute(
+                "SELECT user_id, username, first_name FROM contest_entries"
+            ).fetchall()
     except sqlite3.Error:
         await message.answer("❌ Konkurs bazasi topilmadi yoki hali qatnashchi yo‘q.")
         return
     if not rows:
         await message.answer("Hozircha konkurs qatnashchilari yo‘q.")
         return
-    winner = secrets.choice(rows)
-    uid, username, first_name = winner
+    uid, username, first_name = secrets.choice(rows)
     who = f"@{username}" if username else html.escape(first_name or str(uid))
-    await message.answer(f"🎉 <b>KONKURS G‘OLIBI</b>\n\n👤 {who}\n🆔 <code>{uid}</code>\n👥 Jami qatnashchilar: <b>{len(rows)}</b>")
+    await message.answer(
+        f"🎉 <b>KONKURS G‘OLIBI</b>\n\n👤 {who}\n🆔 <code>{uid}</code>\n"
+        f"👥 Jami qatnashchilar: <b>{len(rows)}</b>"
+    )
 
 
 @router.message(F.text == ADMIN_BROADCAST_BTN)
@@ -284,7 +348,10 @@ async def admin_broadcast_start(message: Message):
         [InlineKeyboardButton(text="✅ Ha, hammaga yuborish", callback_data="admin_broadcast_confirm")],
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_broadcast_cancel")],
     ])
-    await message.answer(f"📢 Reklama <b>{total}</b> ta saqlangan foydalanuvchiga yuboriladi. Davom etasizmi?", reply_markup=kb)
+    await message.answer(
+        f"📢 Reklama <b>{total}</b> ta saqlangan foydalanuvchiga yuboriladi. Davom etasizmi?",
+        reply_markup=kb,
+    )
 
 
 @router.callback_query(F.data == "admin_broadcast_cancel")
@@ -309,15 +376,17 @@ async def admin_broadcast_confirm(callback: CallbackQuery):
     sent = failed = 0
     for uid in ids:
         try:
-            await bot.send_message(uid, AD_TEXT, disable_web_page_preview=True)
-            sent += 1
+            if not is_blocked(DB_PATH, uid):
+                await bot.send_message(uid, ad_text(), disable_web_page_preview=True)
+                sent += 1
         except Exception as exc:
             failed += 1
             log.info("Broadcast yuborilmadi user_id=%s: %s", uid, exc)
         await asyncio.sleep(0.05)
     if callback.message:
         await callback.message.answer(
-            f"✅ <b>Yakunlandi!</b>\n\n👥 Jami: <b>{len(ids)}</b>\n✅ Yuborildi: <b>{sent}</b>\n❌ Yuborilmadi: <b>{failed}</b>",
+            f"✅ <b>Yakunlandi!</b>\n\n👥 Jami: <b>{len(ids)}</b>\n"
+            f"✅ Yuborildi: <b>{sent}</b>\n❌ Yuborilmadi: <b>{failed}</b>",
             reply_markup=admin_reply_keyboard(),
         )
 
@@ -349,19 +418,28 @@ async def choose_link(message: Message):
 @router.message(F.text == BTN_TTS)
 async def choose_tts(message: Message):
     user_modes[message.from_user.id] = "voice_choose"
-    await message.answer("🎙️ Qaysi ElevenLabs tayyor ovozida matnni MP3 qilamiz?\n\nVoice-cloning ishlatilmaydi.", reply_markup=voice_keyboard)
+    await message.answer(
+        "🎙️ Qaysi ElevenLabs tayyor ovozida matnni MP3 qilamiz?\n\nVoice-cloning ishlatilmaydi.",
+        reply_markup=voice_keyboard,
+    )
 
 
 @router.message(F.text == BTN_MALE)
 async def choose_tts_male(message: Message):
     user_modes[message.from_user.id] = "tts_male"
-    await message.answer("👨 Erkak ovozi tanlandi. Endi matn yuboring.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+    await message.answer(
+        "👨 Erkak ovozi tanlandi. Endi matn yuboring.",
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard,
+    )
 
 
 @router.message(F.text == BTN_FEMALE)
 async def choose_tts_female(message: Message):
     user_modes[message.from_user.id] = "tts_female"
-    await message.answer("👩 Ayol ovozi tanlandi. Endi matn yuboring.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+    await message.answer(
+        "👩 Ayol ovozi tanlandi. Endi matn yuboring.",
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard,
+    )
 
 
 @router.message(F.text == "⬅️ Asosiy menyu")
@@ -374,8 +452,16 @@ async def text_to_speech(text: str, voice_id: str, destination: Path):
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY topilmadi")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Accept": "audio/mpeg", "Content-Type": "application/json"}
-    payload = {"text": text, "model_id": TTS_MODEL_ID, "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "text": text,
+        "model_id": TTS_MODEL_ID,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
     async with ClientSession(timeout=ClientTimeout(total=120, connect=20)) as session:
         async with session.post(url, headers=headers, json=payload) as response:
             if response.status != 200:
@@ -406,7 +492,11 @@ async def process_tts(message: Message, text: str, mode: str):
             with tempfile.TemporaryDirectory(prefix="asaved_tts_") as tmp:
                 audio = Path(tmp) / "asaved_voice.mp3"
                 await text_to_speech(text, TTS_VOICES[key], audio)
-                await message.answer_audio(FSInputFile(audio), title="ASAVED AI ovoz", caption=f"✅ Tayyor! {'Erkak' if key == 'male' else 'Ayol'} AI ovozi")
+                await message.answer_audio(
+                    FSInputFile(audio),
+                    title="ASAVED AI ovoz",
+                    caption=f"✅ Tayyor! {'Erkak' if key == 'male' else 'Ayol'} AI ovozi",
+                )
         await status.delete()
     except Exception:
         log.exception("TTS generation failed")
@@ -438,21 +528,31 @@ async def download_telegram_video(message: Message, target: Path):
 
 
 async def run_ffmpeg(args: list[str]):
-    proc = await asyncio.create_subprocess_exec("ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
     _, err = await proc.communicate()
     if proc.returncode:
         raise RuntimeError(err.decode("utf-8", "ignore")[-1000:] or "FFmpeg xatoligi")
 
 
 async def make_round(src: Path, dst: Path):
-    await run_ffmpeg(["-i", str(src), "-t", "60", "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
-        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27", "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-movflags", "+faststart", str(dst)])
+    await run_ffmpeg([
+        "-i", str(src), "-t", "60",
+        "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27",
+        "-c:a", "aac", "-b:a", "96k", "-ac", "2", "-movflags", "+faststart", str(dst),
+    ])
 
 
 async def make_916(src: Path, dst: Path):
-    await run_ffmpeg(["-i", str(src), "-vf", "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
-        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "26", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst)])
+    await run_ffmpeg([
+        "-i", str(src),
+        "-vf", "scale=720:1280:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=720:1280,setsar=1",
+        "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "26",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(dst),
+    ])
 
 
 async def process_uploaded_video(message: Message, mode: str):
@@ -484,7 +584,9 @@ def valid_video_url(raw: str) -> bool:
     try:
         p = urlparse(raw.strip())
         host = (p.hostname or "").lower()
-        return p.scheme == "https" and (host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS))
+        return p.scheme == "https" and (
+            host in ALLOWED_HOSTS or any(host.endswith("." + h) for h in ALLOWED_HOSTS)
+        )
     except Exception:
         return False
 
@@ -504,15 +606,27 @@ async def download_public_link(url: str, folder: Path) -> Path:
     except ImportError:
         raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt ni tekshiring.")
     opts = {
-        "format": "bestvideo+bestaudio/best", "format_sort": ["res", "quality", "fps"],
-        "outtmpl": str(folder / "link_video.%(ext)s"), "noplaylist": True,
-        "max_filesize": MAX_LINK_BYTES, "socket_timeout": 15, "retries": 1,
-        "fragment_retries": 1, "extractor_retries": 1, "concurrent_fragment_downloads": 4,
-        "quiet": True, "no_warnings": True, "merge_output_format": "mp4", "remuxvideo": "mp4",
+        "format": "bestvideo+bestaudio/best",
+        "format_sort": ["res", "quality", "fps"],
+        "outtmpl": str(folder / "link_video.%(ext)s"),
+        "noplaylist": True,
+        "max_filesize": MAX_LINK_BYTES,
+        "socket_timeout": 15,
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
+        "concurrent_fragment_downloads": 4,
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+        "remuxvideo": "mp4",
     }
+
     def download():
+        import yt_dlp
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
+
     await asyncio.to_thread(download)
     files = [p for p in folder.iterdir() if p.is_file() and p.name.startswith("link_video.")]
     if not files:
@@ -543,11 +657,16 @@ async def handle_text(message: Message):
             async with VIDEO_SEMAPHORE:
                 with tempfile.TemporaryDirectory(prefix="asaved_link_") as tmp:
                     path = await download_public_link(text, Path(tmp))
-                    await message.answer_video(FSInputFile(path), caption=f"✅ {title} videosi MP4 formatda tayyor!")
+                    await message.answer_video(
+                        FSInputFile(path),
+                        caption=f"✅ {title} videosi MP4 formatda tayyor!",
+                    )
             await status.delete()
         except Exception:
             log.exception("Link download failed")
-            await status.edit_text("❌ Videoni olib bo‘lmadi. Havola yopiq, platforma cheklagan yoki video juda katta bo‘lishi mumkin.")
+            await status.edit_text(
+                "❌ Videoni olib bo‘lmadi. Havola yopiq, platforma cheklagan yoki video juda katta bo‘lishi mumkin."
+            )
         finally:
             user_modes.pop(message.from_user.id, None)
         return
@@ -557,7 +676,10 @@ async def handle_text(message: Message):
     if valid_video_url(text):
         await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
     else:
-        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+        await message.answer(
+            "Menyudan kerakli funksiyani tanlang.",
+            reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard,
+        )
 
 
 @router.message(F.video | F.document)
@@ -574,13 +696,22 @@ async def handle_video(message: Message):
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user and message.from_user.id in ADMIN_IDS else keyboard)
+    await message.answer(
+        "Menyudan kerakli funksiyani tanlang.",
+        reply_markup=admin_reply_keyboard()
+        if message.from_user and message.from_user.id in ADMIN_IDS else keyboard,
+    )
 
 
 async def on_startup():
     init_user_db()
     url = f"{BASE_URL}/{WEBHOOK_PATH}"
-    await bot.set_webhook(url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True, allowed_updates=dp.resolve_used_update_types())
+    await bot.set_webhook(
+        url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=dp.resolve_used_update_types(),
+    )
     log.info("Webhook set: %s", url)
 
 
@@ -592,14 +723,32 @@ async def on_shutdown():
 async def main():
     init_user_db()
     app = web.Application(client_max_size=2 * 1024 * 1024)
-    # Konkurs Mini App endpointlari: contest.py va webapp/index.html alohida turadi.
+
+    # Konkurs Mini App o‘z holicha saqlanadi; Web Panelda konkurs boshqaruvi yo‘q.
     setup_contest(app, bot, ADMIN_IDS)
-    app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
-    app.router.add_get("/health", lambda request: web.Response(text="ok"))
-    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path=f"/{WEBHOOK_PATH}")
+
+    # Admin Web Panel: /admin
+    setup_admin_panel(app, bot, DB_PATH, WEBHOOK_SECRET, ADMIN_IDS)
+
+    async def index(_request):
+        return web.Response(text="ASAVED bot is running")
+
+    async def health(_request):
+        return web.Response(text="ok")
+
+    app.router.add_get("/", index)
+    app.router.add_get("/health", health)
+
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=f"/{WEBHOOK_PATH}")
     setup_application(app, dp, bot=bot)
-    app.on_startup.append(lambda app: on_startup())
-    app.on_cleanup.append(lambda app: on_shutdown())
+
+    app.on_startup.append(lambda _app: on_startup())
+    app.on_cleanup.append(lambda _app: on_shutdown())
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
