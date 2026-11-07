@@ -53,6 +53,7 @@ BTN_TTS = "🎙️ Matnni ovozga aylantirish"
 BTN_MALE = "👨 Erkak ovozi"
 BTN_FEMALE = "👩 Ayol ovozi"
 ADMIN_BROADCAST_BTN = "📢 Reklamani hammaga yuborish"
+ADMIN_PANEL_BTN = "⚙️ Admin panel"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -73,6 +74,8 @@ ADMIN_IDS = {
     int(x.strip()) for x in _ad_ids.replace(";", ",").split(",")
     if x.strip().isdigit()
 }
+# Asosiy admin Telegram ID
+ADMIN_IDS.add(8461889678)
 
 AD_TEXT_DEFAULT = (
     "🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\n"
@@ -264,6 +267,7 @@ router.message.middleware(SubscriptionMiddleware())
 def admin_reply_keyboard() -> ReplyKeyboardMarkup:
     rows = [list(row) for row in keyboard.keyboard]
     rows.append([KeyboardButton(text=ADMIN_BROADCAST_BTN)])
+    rows.append([KeyboardButton(text=ADMIN_PANEL_BTN, web_app=WebAppInfo(url=f"{BASE_URL}/admin"))])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
