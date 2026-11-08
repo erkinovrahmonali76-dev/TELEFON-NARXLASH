@@ -35,10 +35,8 @@ BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 CHANNEL_USERNAME = "@ReklamaBozoriUzz"
 CHANNEL_URL = "https://t.me/ReklamaBozoriUzz"
 
-# SQLite bazasi. Render Persistent Disk ishlatilsa DB_PATH=/var/data/asaved_users.db qiling.
 DB_PATH = os.getenv("DB_PATH", "asaved_users.db")
 
-# Har bir foydalanuvchiga bir marta yuboriladigan reklama xabari.
 AD_TEXT = (
     "🚀 <b>KANALINGIZNI KO‘PROQ INSONLARGA TANITING!</b>\n\n"
     "Telegram kanalingiz rivojlanishini, yangi obunachilar e’tiboriga tushishini "
@@ -59,10 +57,11 @@ if not WEBHOOK_SECRET or not re.fullmatch(r"[A-Za-z0-9_-]{16,256}", WEBHOOK_SECR
 if not BASE_URL:
     raise RuntimeError("RENDER_EXTERNAL_URL topilmadi. Render Web Service ishlatayotganingizni tekshiring")
 
+from game_system import game_router, init_games_db, home_keyboard as games_home_keyboard
+
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 router = Router()
-dp.include_router(router)
 
 BTN_ROUND = "🎥 Dumaloq video"
 BTN_LINK = "🔗 Video havolasi"
@@ -70,12 +69,14 @@ BTN_916 = "📱 9:16 format"
 BTN_TTS = "🎙️ Matnni ovozga aylantirish"
 BTN_MALE = "👨 Erkak ovozi"
 BTN_FEMALE = "👩 Ayol ovozi"
+BTN_GAMES = "🎮 Do‘stlar Battle"
 
 keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_ROUND), KeyboardButton(text=BTN_916)],
         [KeyboardButton(text=BTN_LINK)],
         [KeyboardButton(text=BTN_TTS)],
+        [KeyboardButton(text=BTN_GAMES)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Kerakli funksiyani tanlang"
@@ -88,7 +89,6 @@ subscribe_keyboard = InlineKeyboardMarkup(
     ]
 )
 
-# Har bir foydalanuvchining keyingi yuboradigan videosi uchun rejim.
 user_modes: dict[int, str] = {}
 subscription_cache: dict[int, float] = {}
 SUBSCRIPTION_CACHE_SECONDS = 30
@@ -96,7 +96,6 @@ VIDEO_SEMAPHORE = asyncio.Semaphore(2)
 TTS_SEMAPHORE = asyncio.Semaphore(2)
 MAX_TTS_CHARS = 3000
 
-# ElevenLabs tayyor (premade) ovozlari.
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
 TTS_MODEL_ID = os.getenv("ELEVENLABS_MODEL_ID", "eleven_multilingual_v2").strip()
 TTS_VOICES = {
@@ -115,17 +114,14 @@ MAX_OUTPUT_BYTES = 49 * 1024 * 1024
 MAX_LINK_BYTES = 49 * 1024 * 1024
 MAX_SECONDS = 600
 
-# Admin Telegram ID raqamlari: Render Environment -> ADMIN_IDS=123456789,987654321
 _admin_ids_raw = os.getenv("ADMIN_IDS", "") or os.getenv("ADMIN_ID", "")
 ADMIN_IDS = {int(x.strip()) for x in _admin_ids_raw.replace(";", ",").split(",") if x.strip().isdigit()}
 ADMIN_BROADCAST_BTN = "📢 Reklamani hammaga yuborish"
 
 
 def init_user_db():
-    """Reklama yuborilgan Telegram foydalanuvchilarini SQLite'da saqlaydi."""
     db_file = Path(DB_PATH)
     db_file.parent.mkdir(parents=True, exist_ok=True)
-
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS ad_sent_users (
@@ -140,7 +136,6 @@ def init_user_db():
                 last_seen TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # Avvalgi versiyada reklama olgan foydalanuvchilarni ham umumiy ro‘yxatga qo‘shamiz.
         conn.execute("""
             INSERT OR IGNORE INTO bot_users (user_id)
             SELECT user_id FROM ad_sent_users
@@ -164,10 +159,6 @@ def get_all_user_ids() -> list[int]:
 
 
 def mark_ad_sent_once(user_id: int) -> bool:
-    """
-    Foydalanuvchi uchun reklama yuborilganini belgilaydi.
-    True — birinchi marta, False — avval yuborilgan.
-    """
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         cursor = conn.execute(
             "INSERT OR IGNORE INTO ad_sent_users (user_id) VALUES (?)",
@@ -178,17 +169,12 @@ def mark_ad_sent_once(user_id: int) -> bool:
 
 
 async def send_ad_once(chat_id: int, user_id: int):
-    """Har bir foydalanuvchiga reklama xabarini faqat bir marta yuboradi."""
     try:
         if not mark_ad_sent_once(user_id):
             return
-
         await bot.send_message(chat_id, AD_TEXT, disable_web_page_preview=True)
         log.info("Reklama xabari yuborildi: user_id=%s", user_id)
-
     except Exception:
-        # Xabar yuborilmasa, keyingi murojaatida qayta urinib ko'rish uchun
-        # bazadagi belgi olib tashlanadi.
         log.exception("Reklama xabarini yuborishda xatolik: user_id=%s", user_id)
         with sqlite3.connect(DB_PATH, timeout=30) as conn:
             conn.execute("DELETE FROM ad_sent_users WHERE user_id = ?", (user_id,))
@@ -201,7 +187,8 @@ def main_text() -> str:
         "🎥 <b>Dumaloq video</b> — galereyadan 60 soniyagacha video yuboring.\n"
         "📱 <b>9:16 format</b> — galereyadan video yuboring.\n"
         "🔗 <b>Video havolasi</b> — YouTube, Instagram yoki TikTok havolasini yuboring.\n"
-        "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor erkak yoki ayol AI ovozida MP3 qiling.\n\n"
+        "🎙️ <b>Matnni ovozga aylantirish</b> — ElevenLabs tayyor erkak yoki ayol AI ovozida MP3 qiling.\n"
+        "🎮 <b>Do‘stlar Battle</b> — do‘stlaringiz bilan o‘yin o‘ynang.\n\n"
         "Faqat o‘zingizga tegishli yoki yuklab olishga ruxsatingiz bor videolardan foydalaning."
     )
 
@@ -245,27 +232,24 @@ class SubscriptionMiddleware(BaseMiddleware):
     ) -> Any:
         if not event.from_user:
             return await handler(event, data)
-
         register_user(event.from_user.id)
-
-        # Telegram ID ni tekshirish uchun /myid buyrug'i obunasiz ham ishlaydi.
         if event.text and event.text.split()[0].split("@")[0] == "/myid":
             return await handler(event, data)
-
-        # Admin bot funksiyalaridan obunasiz ham foydalana oladi.
         if event.from_user.id in ADMIN_IDS:
             return await handler(event, data)
-
         if await is_subscribed(event.from_user.id):
-            # Obunasi bor foydalanuvchiga reklama faqat bir marta yuboriladi.
             await send_ad_once(event.chat.id, event.from_user.id)
             return await handler(event, data)
-
         await send_subscription_required(event)
         return None
 
 
 router.message.middleware(SubscriptionMiddleware())
+game_router.message.middleware(SubscriptionMiddleware())
+
+# O‘yin routeri avval ulanadi: /start game_CODE havolasi ASAVED /start'dan oldin ushlanadi.
+dp.include_router(game_router)
+dp.include_router(router)
 
 
 @router.callback_query(F.data == "check_subscription")
@@ -273,20 +257,17 @@ async def check_subscription_callback(callback: CallbackQuery):
     if not callback.from_user:
         await callback.answer()
         return
-
     register_user(callback.from_user.id)
-
     if callback.from_user.id in ADMIN_IDS or await is_subscribed(callback.from_user.id, use_cache=False):
         await callback.answer("✅ Obuna tasdiqlandi!", show_alert=False)
         if callback.message:
-            # Yangi obuna bo'lgan foydalanuvchiga ham reklama bir marta yuboriladi.
             await send_ad_once(callback.message.chat.id, callback.from_user.id)
-            await callback.message.answer(main_text(), reply_markup=admin_reply_keyboard() if callback.from_user.id in ADMIN_IDS else keyboard)
+            await callback.message.answer(
+                main_text(),
+                reply_markup=admin_reply_keyboard() if callback.from_user.id in ADMIN_IDS else keyboard
+            )
     else:
-        await callback.answer(
-            "❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!",
-            show_alert=True,
-        )
+        await callback.answer("❌ Hali kanalga obuna bo‘lmagansiz. Avval obuna bo‘ling!", show_alert=True)
 
 
 def admin_reply_keyboard() -> ReplyKeyboardMarkup:
@@ -310,8 +291,8 @@ async def admin_panel(message: Message):
         await message.answer("⛔ Sizda admin huquqi yo‘q.")
         return
     await message.answer(
-        "🛠 <b>Admin panel</b>\\n\\n"
-        f"👥 Bazadagi foydalanuvchilar: <b>{len(get_all_user_ids())}</b>\\n"
+        "🛠 <b>Admin panel</b>\n\n"
+        f"👥 Bazadagi foydalanuvchilar: <b>{len(get_all_user_ids())}</b>\n"
         "Reklamani hammaga yuborish uchun quyidagi tugmani bosing.",
         reply_markup=admin_reply_keyboard()
     )
@@ -327,7 +308,7 @@ async def admin_broadcast_start(message: Message):
         [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin_broadcast_cancel")],
     ])
     await message.answer(
-        f"📢 Reklama <b>{total}</b> ta saqlangan foydalanuvchiga yuboriladi.\\n"
+        f"📢 Reklama <b>{total}</b> ta saqlangan foydalanuvchiga yuboriladi.\n"
         "Har bir bosishda reklama yana qayta yuboriladi. Davom etasizmi?",
         reply_markup=confirm_kb
     )
@@ -348,11 +329,9 @@ async def admin_broadcast_confirm(callback: CallbackQuery):
     if not callback.from_user or callback.from_user.id not in ADMIN_IDS:
         await callback.answer("Ruxsat yo‘q.", show_alert=True)
         return
-
     await callback.answer("Yuborish boshlandi.")
     if callback.message:
         await callback.message.edit_text("⏳ Reklama foydalanuvchilarga yuborilmoqda...")
-
     user_ids = get_all_user_ids()
     sent = 0
     failed = 0
@@ -364,15 +343,25 @@ async def admin_broadcast_confirm(callback: CallbackQuery):
             failed += 1
             log.info("Broadcast yuborilmadi user_id=%s: %s", user_id, exc)
         await asyncio.sleep(0.05)
-
     report = (
-        "✅ <b>Reklama yuborish yakunlandi!</b>\\n\\n"
-        f"👥 Jami ro‘yxatda: <b>{len(user_ids)}</b>\\n"
-        f"✅ Muvaffaqiyatli: <b>{sent}</b>\\n"
+        "✅ <b>Reklama yuborish yakunlandi!</b>\n\n"
+        f"👥 Jami ro‘yxatda: <b>{len(user_ids)}</b>\n"
+        f"✅ Muvaffaqiyatli: <b>{sent}</b>\n"
         f"❌ Yuborilmadi: <b>{failed}</b>"
     )
     if callback.message:
         await callback.message.answer(report, reply_markup=admin_reply_keyboard())
+
+
+@router.message(F.text == BTN_GAMES)
+async def open_games_menu(message: Message):
+    await message.answer(
+        "🎮 <b>DO‘STLAR BATTLE</b>\n\n"
+        "Do‘stlaringiz bilan o‘ynash uchun xona yarating.\n"
+        "Guruhda ham, shaxsiy chatda ham ishlaydi.\n\n"
+        "Yoki /games buyrug‘ini yuboring.",
+        reply_markup=games_home_keyboard()
+    )
 
 
 @router.message(CommandStart())
@@ -441,14 +430,15 @@ async def choose_tts_female(message: Message):
 @router.message(F.text == "⬅️ Asosiy menyu")
 async def back_to_menu(message: Message):
     user_modes.pop(message.from_user.id, None)
-    await message.answer(main_text(), reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+    await message.answer(
+        main_text(),
+        reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
+    )
 
 
 async def text_to_speech(text: str, voice_id: str, destination: Path):
-    """ElevenLabs'ning tayyor ovozida matnni MP3 ga aylantiradi."""
     if not ELEVENLABS_API_KEY:
         raise RuntimeError("Render Environment'da ELEVENLABS_API_KEY topilmadi")
-
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
         "xi-api-key": ELEVENLABS_API_KEY,
@@ -458,10 +448,7 @@ async def text_to_speech(text: str, voice_id: str, destination: Path):
     payload = {
         "text": text,
         "model_id": TTS_MODEL_ID,
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75,
-        },
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }
     timeout = ClientTimeout(total=120, connect=20)
     async with ClientSession(timeout=timeout) as session:
@@ -475,7 +462,6 @@ async def text_to_speech(text: str, voice_id: str, destination: Path):
                     raise RuntimeError("ElevenLabs limiti yoki kreditlari tugagan bo‘lishi mumkin")
                 raise RuntimeError(f"ElevenLabs API xatosi ({response.status})")
             audio_data = await response.read()
-
     if not audio_data:
         raise RuntimeError("ElevenLabs bo‘sh audio qaytardi")
     destination.write_bytes(audio_data)
@@ -489,13 +475,12 @@ async def process_tts(message: Message, text: str, mode: str):
         await message.answer("Ovozga aylantirish uchun matn yuboring.")
         return
     voice_key = "male" if mode == "tts_male" else "female"
-    voice = TTS_VOICES[voice_key]
     status = await message.answer("🎙️ Matn ovozga aylantirilmoqda...")
     try:
         async with TTS_SEMAPHORE:
             with tempfile.TemporaryDirectory(prefix="asaved_tts_") as tmp:
                 audio_path = Path(tmp) / "asaved_voice.mp3"
-                await text_to_speech(text, voice, audio_path)
+                await text_to_speech(text, TTS_VOICES[voice_key], audio_path)
                 if not audio_path.exists() or audio_path.stat().st_size == 0:
                     raise RuntimeError("Audio fayl yaratilmadi")
                 await message.answer_audio(
@@ -545,8 +530,7 @@ async def run_ffmpeg(args: list[str]):
 
 async def make_round(src: Path, dst: Path):
     await run_ffmpeg([
-        "-i", str(src),
-        "-t", "60",
+        "-i", str(src), "-t", "60",
         "-vf", "scale=640:640:force_original_aspect_ratio=increase:flags=fast_bilinear,crop=640:640,setsar=1",
         "-c:v", "libx264", "-preset", "ultrafast", "-threads", "0", "-crf", "27",
         "-c:a", "aac", "-b:a", "96k", "-ac", "2",
@@ -616,7 +600,6 @@ async def download_public_link(url: str, folder: Path, platform: str | None = No
         import yt_dlp
     except ImportError:
         raise RuntimeError("yt-dlp o‘rnatilmagan. requirements.txt faylini tekshiring.")
-
     platform = platform or detect_platform(url)[0]
     output_template = str(folder / "link_video.%(ext)s")
     options = {
@@ -656,15 +639,12 @@ async def download_public_link(url: str, folder: Path, platform: str | None = No
 async def handle_text(message: Message):
     text = (message.text or "").strip()
     mode = user_modes.get(message.from_user.id)
-
     if mode in ("tts_male", "tts_female"):
         await process_tts(message, text, mode)
         return
-
     if mode == "voice_choose":
         await message.answer("Avval 👨 Erkak ovozi yoki 👩 Ayol ovozini tanlang.", reply_markup=voice_keyboard)
         return
-
     if mode == "link":
         if not valid_video_url(text):
             await message.answer("❌ Faqat HTTPS YouTube, Instagram yoki TikTok video havolasini yuboring.")
@@ -690,15 +670,16 @@ async def handle_text(message: Message):
         finally:
             user_modes.pop(message.from_user.id, None)
         return
-
     if mode in ("round", "916"):
         await message.answer("Iltimos, havola emas, galereyadan video fayl yuboring.")
         return
-
     if valid_video_url(text):
         await message.answer("Avval 🔗 Video havolasi tugmasini bosing, keyin havolani yuboring.")
     else:
-        await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+        await message.answer(
+            "Menyudan kerakli funksiyani tanlang.",
+            reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard
+        )
 
 
 @router.message(F.video | F.document)
@@ -715,11 +696,15 @@ async def handle_video(message: Message):
 
 @router.message()
 async def fallback(message: Message):
-    await message.answer("Menyudan kerakli funksiyani tanlang.", reply_markup=admin_reply_keyboard() if message.from_user.id in ADMIN_IDS else keyboard)
+    await message.answer(
+        "Menyudan kerakli funksiyani tanlang.",
+        reply_markup=admin_reply_keyboard() if message.from_user and message.from_user.id in ADMIN_IDS else keyboard
+    )
 
 
 async def on_startup():
     init_user_db()
+    init_games_db()
     webhook_url = f"{BASE_URL}/{WEBHOOK_PATH}"
     await bot.set_webhook(
         webhook_url,
@@ -736,9 +721,8 @@ async def on_shutdown():
 
 
 async def main():
-    # Bazani webhook ishga tushishidan oldin ham tayyorlaymiz.
     init_user_db()
-
+    init_games_db()
     app = web.Application(client_max_size=2 * 1024 * 1024)
     app.router.add_get("/", lambda request: web.Response(text="ASAVED bot is running"))
     app.router.add_get("/health", lambda request: web.Response(text="ok"))
